@@ -77,7 +77,8 @@
     UIView *formCard = [self cardView];
     UIStackView *form = [self verticalStackInCard:formCard];
     self.playerField = [self fieldWithPlaceholder:@"玩家名称"];
-    NSString *username = BaseAuthenticator.current.authData[@"username"];
+    BaseAuthenticator *currentAuth = (BaseAuthenticator *)BaseAuthenticator.current;
+    NSString *username = currentAuth.authData[@"username"];
     if ([username hasPrefix:@"Demo."]) username = [username substringFromIndex:5];
     self.playerField.text = username.length > 0 ? username : @"Player";
     [form addArrangedSubview:self.playerField];
