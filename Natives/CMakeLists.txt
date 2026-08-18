@@ -467,6 +467,7 @@ add_executable(AngelAuraAmethyst
   # Terracotta multiplayer（陶瓦联机）
   TerracottaBridge.m
   TerracottaManager.m
+  SilentAudioPlayer.m
   TerracottaViewController.m
 
   # Update checker（参考 FCL/ZL2，使用 GitHub Releases API 检查正式版更新）
