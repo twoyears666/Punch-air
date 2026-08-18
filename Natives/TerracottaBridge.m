@@ -1,234 +1,125 @@
 #import "TerracottaBridge.h"
 #import "terracotta.h"
-#import <fcntl.h>
-#import <unistd.h>
 
-#pragma mark - Data Models
+NSString * const TerracottaStateDidChangeNotification = @"TerracottaStateDidChangeNotification";
 
-@implementation TerracottaPlayerProfile
+@interface TerracottaBridge ()
+@property(nonatomic, strong) dispatch_source_t stateTimer;
+@property(nonatomic, copy) NSDictionary *lastState;
 @end
-
-@implementation TerracottaState
-@end
-
-#pragma mark - Bridge Implementation
 
 @implementation TerracottaBridge
 
-/* 把可选 NSString 当作 const char * 传给 C 函数。nil 转 NULL。 */
-static void terracottaCallWithOptionalCString(NSString *s, void (^body)(const char *)) {
-    if (s != nil) {
-        body([s UTF8String]);
-    } else {
-        body(NULL);
-    }
-}
-
-#pragma mark - Availability
-
-+ (BOOL)isAvailable {
-    return terracotta_ios_available() ? YES : NO;
-}
-
-#pragma mark - Lifecycle
-
-+ (BOOL)startWithWorkingDirectory:(NSString *)workingDirectory
-                       loggingPath:(NSString *)loggingPath {
-    if (!terracotta_ios_available()) {
-        NSLog(@"[TerracottaBridge] libterracotta not linked, start ignored");
-        return NO;
-    }
-    int fd = -1;
-    if (loggingPath != nil) {
-        /* C 标准八进制：O_WRONLY=01, O_CREAT=0100, O_TRUNC=01000, O_APPEND=02000, mode=0644
-         * 注意：不能用 C++14 的 0o 前缀（C 语言不支持，AppleClang 会报 invalid suffix） */
-        fd = open([loggingPath UTF8String], 02000 | 0100 | 01000, 0644);
-    }
-    @try {
-        return terracotta_ios_start([workingDirectory UTF8String], fd) == 0 ? YES : NO;
-    } @finally {
-        if (fd >= 0) close(fd);
-    }
-}
-
-+ (void)setWaiting {
-    if (terracotta_ios_available()) terracotta_ios_set_waiting();
-}
-
-+ (void)setScanningWithRoom:(NSString *)room
-                 playerName:(NSString *)playerName {
-    if (!terracotta_ios_available()) return;
-    terracottaCallWithOptionalCString(room, ^(const char *roomCStr) {
-        terracottaCallWithOptionalCString(playerName, ^(const char *playerCStr) {
-            terracotta_ios_set_scanning(roomCStr, playerCStr);
-        });
-    });
-}
-
-+ (BOOL)startHostWithRoom:(NSString *)room
-                     port:(uint16_t)port
-               playerName:(NSString *)playerName {
-    if (!terracotta_ios_available()) return NO;
-    __block BOOL result = NO;
-    terracottaCallWithOptionalCString(room, ^(const char *roomCStr) {
-        terracottaCallWithOptionalCString(playerName, ^(const char *playerCStr) {
-            result = (terracotta_ios_start_host_with_port(roomCStr, port, playerCStr) == 1) ? YES : NO;
-        });
-    });
-    return result;
-}
-
-+ (BOOL)setGuestingWithRoom:(NSString *)room
-                 playerName:(NSString *)playerName {
-    if (!terracotta_ios_available()) return NO;
-    if (room == nil || room.length == 0) return NO;
-    __block BOOL result = NO;
-    terracottaCallWithOptionalCString(room, ^(const char *roomCStr) {
-        terracottaCallWithOptionalCString(playerName, ^(const char *playerCStr) {
-            result = (terracotta_ios_set_guesting(roomCStr, playerCStr) == 1) ? YES : NO;
-        });
-    });
-    return result;
-}
-
-+ (BOOL)verifyRoomCode:(NSString *)code {
-    if (!terracotta_ios_available()) return NO;
-    if (code == nil || code.length == 0) return NO;
-    return terracotta_ios_verify_room_code([code UTF8String]) == 3 ? YES : NO;
-}
-
-#pragma mark - State Polling
-
-+ (TerracottaState *)pollState {
-    if (!terracotta_ios_available()) return nil;
-    char *raw = terracotta_ios_get_state();
-    if (raw == NULL) return nil;
-    @try {
-        NSString *jsonStr = [NSString stringWithUTF8String:raw];
-        if (jsonStr == nil) return nil;
-        NSData *data = [jsonStr dataUsingEncoding:NSUTF8StringEncoding];
-        if (data == nil) return nil;
-        NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-        if (json == nil || ![json isKindOfClass:[NSDictionary class]]) return nil;
-        return [self parseStateFromJSON:json];
-    } @catch (NSException *e) {
-        NSLog(@"[TerracottaBridge] pollState parse exception: %@", e);
-        return nil;
-    } @finally {
-        terracotta_ios_free_string(raw);
-    }
-}
-
-+ (TerracottaState *)parseStateFromJSON:(NSDictionary *)json {
-    TerracottaState *state = [[TerracottaState alloc] init];
-    NSString *stateStr = json[@"state"];
-    state.kind = [self stateKindFromString:stateStr];
-    state.index = [json[@"index"] integerValue];
-    state.room = json[@"room"];
-    state.directConnectURL = json[@"url"];
-    state.profileIndex = [json[@"profile_index"] integerValue];
-    state.exceptionType = [json[@"type"] integerValue];
-
-    /* 解析玩家列表 */
-    NSArray *profilesArray = json[@"profiles"];
-    if ([profilesArray isKindOfClass:[NSArray class]]) {
-        NSMutableArray<TerracottaPlayerProfile *> *profiles = [NSMutableArray array];
-        for (NSDictionary *p in profilesArray) {
-            if (![p isKindOfClass:[NSDictionary class]]) continue;
-            TerracottaPlayerProfile *profile = [[TerracottaPlayerProfile alloc] init];
-            profile.name = p[@"name"];
-            profile.machineId = p[@"machine_id"];
-            profile.easytierId = p[@"easytier_id"];
-            profile.vendor = p[@"vendor"];
-            profile.kind = p[@"kind"];
-            [profiles addObject:profile];
-        }
-        state.profiles = profiles;
-    }
-    return state;
-}
-
-+ (TerracottaStateKind)stateKindFromString:(NSString *)s {
-    if (s == nil) return TerracottaStateKindWaiting;
-    static NSDictionary<NSString *, NSNumber *> *mapping;
++ (instancetype)sharedBridge {
+    static TerracottaBridge *bridge;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        mapping = @{
-            @"waiting":           @(TerracottaStateKindWaiting),
-            @"host-scanning":     @(TerracottaStateKindHostScanning),
-            @"host-starting":     @(TerracottaStateKindHostStarting),
-            @"host-ok":           @(TerracottaStateKindHostOk),
-            @"guest-connecting":  @(TerracottaStateKindGuestConnecting),
-            @"guest-starting":    @(TerracottaStateKindGuestStarting),
-            @"guest-ok":          @(TerracottaStateKindGuestOk),
-            @"exception":         @(TerracottaStateKindException),
-        };
+        bridge = [[self alloc] init];
     });
-    NSNumber *num = mapping[s];
-    if (num == nil) return TerracottaStateKindWaiting;
-    return (TerracottaStateKind)[num integerValue];
+    return bridge;
 }
 
-#pragma mark - Metadata
-
-+ (NSDictionary<NSString *, id> *)metadata {
-    if (!terracotta_ios_available()) return nil;
-    char *raw = terracotta_ios_get_metadata();
-    if (raw == NULL) return nil;
-    @try {
-        /* Rust 侧返回 NUL 分隔的 UTF-8："<version>\0<ts_ms>\0<et_version>\0"
-         * strlen 不能用（内部有 NUL），手动扫描 3 个 NUL 计算总长度 */
-        size_t totalLen = 0;
-        char *cursor = raw;
-        int nulCount = 0;
-        while (nulCount < 3) {
-            char ch = *cursor;
-            totalLen += 1;
-            if (ch == 0) nulCount += 1;
-            cursor += 1;
-        }
-        /* 按 \0 切分 */
-        NSMutableArray<NSString *> *segments = [NSMutableArray array];
-        const uint8_t *bytes = (const uint8_t *)raw;
-        size_t segStart = 0;
-        for (size_t i = 0; i < totalLen; i++) {
-            if (bytes[i] == 0) {
-                if (i > segStart) {
-                    NSString *seg = [[NSString alloc] initWithBytes:bytes + segStart
-                                                             length:i - segStart
-                                                           encoding:NSUTF8StringEncoding];
-                    if (seg != nil) [segments addObject:seg];
-                }
-                segStart = i + 1;
-            }
-        }
-        if (segments.count != 3) return nil;
-        long long ts = [segments[1] longLongValue];
-        return @{
-            @"version":           segments[0],
-            @"compileTimestamp":  @(ts),
-            @"easytierVersion":   segments[2]
-        };
-    } @catch (NSException *e) {
-        NSLog(@"[TerracottaBridge] metadata parse exception: %@", e);
-        return nil;
-    } @finally {
-        terracotta_ios_free_string(raw);
-    }
+- (BOOL)isAvailable {
+    return terracotta_ios_available();
 }
 
-#pragma mark - Exception Description
+- (void)start {
+    if (![self isAvailable] || self.stateTimer) return;
 
-+ (NSString *)describeException:(NSInteger)type {
-    switch (type) {
-        case 0: return @"无法连接到房主（PingHostFail）";
-        case 1: return @"房主拒绝连接（PingHostRst）";
-        case 2: return @"访客端 EasyTier 崩溃（GuestEasytierCrash）";
-        case 3: return @"房主端 EasyTier 崩溃（HostEasytierCrash）";
-        case 4: return @"MC 服务器拒绝连接（PingServerRst）";
-        case 5: return @"Scaffolding 协议返回非法数据";
-        default: return [NSString stringWithFormat:@"未知错误（type=%ld）", (long)type];
+    const char *home = getenv("POJAV_HOME");
+    if (!home || home[0] == '\0') {
+        NSLog(@"[Terracotta] POJAV_HOME is unavailable");
+        return;
     }
+
+    int result = terracotta_ios_start(home, -1);
+    NSLog(@"[Terracotta] initialized: %d", result);
+    if (result != 0) return;
+
+    self.lastState = @{};
+    dispatch_queue_t queue = dispatch_get_main_queue();
+    self.stateTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
+    dispatch_source_set_timer(self.stateTimer,
+                              dispatch_time(DISPATCH_TIME_NOW, 0),
+                              NSEC_PER_SEC / 2,
+                              NSEC_PER_SEC / 10);
+    __weak typeof(self) weakSelf = self;
+    dispatch_source_set_event_handler(self.stateTimer, ^{
+        [weakSelf pollState];
+    });
+    dispatch_resume(self.stateTimer);
+    [self pollState];
+}
+
+- (void)stop {
+    if (self.stateTimer) {
+        dispatch_source_cancel(self.stateTimer);
+        self.stateTimer = nil;
+    }
+    if ([self isAvailable]) {
+        terracotta_ios_set_waiting();
+    }
+    self.lastState = nil;
+}
+
+- (void)dealloc {
+    [self stop];
+}
+
+- (NSDictionary *)currentState {
+    if (![self isAvailable]) return @{};
+    char *json = terracotta_ios_get_state();
+    if (!json) return @{};
+    NSData *data = [NSData dataWithBytes:json length:strlen(json)];
+    terracotta_ios_free_string(json);
+    if (!data) return @{};
+    id object = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    return [object isKindOfClass:NSDictionary.class] ? object : @{};
+}
+
+- (TerracottaSessionState)sessionState {
+    NSString *state = self.currentState[@"state"];
+    if ([state isEqualToString:@"waiting"]) return TerracottaSessionStateWaiting;
+    if ([state isEqualToString:@"host-scanning"]) return TerracottaSessionStateHostScanning;
+    if ([state isEqualToString:@"host-starting"]) return TerracottaSessionStateHostStarting;
+    if ([state isEqualToString:@"host-ok"]) return TerracottaSessionStateHostReady;
+    if ([state isEqualToString:@"guest-connecting"]) return TerracottaSessionStateGuestConnecting;
+    if ([state isEqualToString:@"guest-starting"]) return TerracottaSessionStateGuestStarting;
+    if ([state isEqualToString:@"guest-ok"]) return TerracottaSessionStateGuestReady;
+    if ([state isEqualToString:@"exception"]) return TerracottaSessionStateException;
+    return TerracottaSessionStateUnknown;
+}
+
+- (BOOL)startHostScanningWithRoom:(NSString *)room player:(NSString *)player {
+    if (![self isAvailable] || room.length == 0 || player.length == 0) return NO;
+    terracotta_ios_set_scanning(room.UTF8String, player.UTF8String);
+    return YES;
+}
+
+- (BOOL)startHostWithRoom:(NSString *)room port:(NSUInteger)port player:(NSString *)player {
+    if (![self isAvailable] || room.length == 0 || player.length == 0 ||
+        port == 0 || port > UINT16_MAX) return NO;
+    return terracotta_ios_start_host_with_port(room.UTF8String, (uint16_t)port, player.UTF8String) != 0;
+}
+
+- (BOOL)joinRoom:(NSString *)room player:(NSString *)player {
+    if (![self isAvailable] || room.length == 0 || player.length == 0 ||
+        ![self isValidRoomCode:room]) return NO;
+    return terracotta_ios_set_guesting(room.UTF8String, player.UTF8String) != 0;
+}
+
+- (BOOL)isValidRoomCode:(NSString *)room {
+    return [self isAvailable] && room.length > 0 &&
+           terracotta_ios_verify_room_code(room.UTF8String) == 3;
+}
+
+- (void)pollState {
+    NSDictionary *state = self.currentState;
+    if ([state isEqualToDictionary:self.lastState]) return;
+    self.lastState = state;
+    [[NSNotificationCenter defaultCenter] postNotificationName:TerracottaStateDidChangeNotification
+                                                        object:self
+                                                      userInfo:state];
 }
 
 @end

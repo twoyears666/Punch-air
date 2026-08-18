@@ -56,23 +56,21 @@ set(ZT_FRAMEWORK_LINK "")
 set(ZT_CXX_LIB "")
 
 # ============================================================================
-# libterracotta.xcframework 集成（陶瓦联机）—— 暂时移除（注释掉以排查启动崩溃）
+# libterracotta.xcframework 集成（陶瓦联机）
 # ============================================================================
-# set(TERRACOTTA_LIB_DIR "${CMAKE_CURRENT_LIST_DIR}/terracotta")
-# set(TERRACOTTA_XCFW "${TERRACOTTA_LIB_DIR}/libterracotta.xcframework")
-# set(TERRACOTTA_LIB "")
-# set(TERRACOTTA_AVAILABLE OFF)
-# if(EXISTS "${TERRACOTTA_XCFW}/ios-arm64/libterracotta.a")
-#   set(_TC_LIB_PATH "${TERRACOTTA_XCFW}/ios-arm64/libterracotta.a")
-#   set(TERRACOTTA_LIB "-Wl,-force_load,${_TC_LIB_PATH}")
-#   set(TERRACOTTA_AVAILABLE ON)
-# elseif(EXISTS "${TERRACOTTA_LIB_DIR}/libterracotta.a")
-#   set(_TC_LIB_PATH "${TERRACOTTA_LIB_DIR}/libterracotta.a")
-#   set(TERRACOTTA_LIB "-Wl,-force_load,${_TC_LIB_PATH}")
-#   set(TERRACOTTA_AVAILABLE ON)
-# endif()
+set(TERRACOTTA_LIB_DIR "${CMAKE_CURRENT_LIST_DIR}/terracotta")
+set(TERRACOTTA_XCFW "${TERRACOTTA_LIB_DIR}/libterracotta.xcframework")
 set(TERRACOTTA_LIB "")
 set(TERRACOTTA_AVAILABLE OFF)
+if(EXISTS "${TERRACOTTA_XCFW}/ios-arm64/libterracotta.a")
+  set(_TC_LIB_PATH "${TERRACOTTA_XCFW}/ios-arm64/libterracotta.a")
+  set(TERRACOTTA_LIB "-Wl,-force_load,${_TC_LIB_PATH}")
+  set(TERRACOTTA_AVAILABLE ON)
+elseif(EXISTS "${TERRACOTTA_LIB_DIR}/libterracotta.a")
+  set(_TC_LIB_PATH "${TERRACOTTA_LIB_DIR}/libterracotta.a")
+  set(TERRACOTTA_LIB "-Wl,-force_load,${_TC_LIB_PATH}")
+  set(TERRACOTTA_AVAILABLE ON)
+endif()
 
 # For cacio support library
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -rpath @loader_path -rpath @executable_path/java_runtimes/java-8-openjdk/lib -rpath /usr/lib/jvm/java-8-openjdk/lib")
@@ -466,11 +464,9 @@ add_executable(AngelAuraAmethyst
   TouchControllerBridge.m
   TouchControllerPreferencesViewController.m
 
-  # Terracotta multiplayer（陶瓦联机）—— 暂时移除（排查启动崩溃）
-  # TerracottaBridge.m
-  # TerracottaManager.m
-  # SilentAudioPlayer.m
-  # TerracottaViewController.m
+  # Terracotta multiplayer（陶瓦联机）
+  TerracottaBridge.m
+  TerracottaManager.m
 
   # Update checker（参考 FCL/ZL2，使用 GitHub Releases API 检查正式版更新）
   UpdateChecker.m
@@ -536,7 +532,10 @@ target_link_libraries(AngelAuraAmethyst
   "-framework WebKit"
   "-weak_framework SafariServices"
   ${TOUCHCONTROLLER_LIB}
-  # Terracotta multiplayer 暂时移除：${TERRACOTTA_LIB} "-lc++" "-lresolv"
+  # Terracotta multiplayer
+  ${TERRACOTTA_LIB}
+  "-lc++"
+  "-lresolv"
 )
 set_target_properties(AngelAuraAmethyst PROPERTIES
   MACOSX_BUNDLE TRUE
