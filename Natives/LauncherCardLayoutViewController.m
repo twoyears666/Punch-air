@@ -16,11 +16,8 @@
 #import "ModpackImportViewController.h"
 #import "LauncherPrefGameDirViewController.h"
 #import "CustomControlsViewController.h"
-// ZeroTier/Terracotta 联机暂时移除（排查启动崩溃）
-// #import "MultiplayerViewController.h"
-// #import "TerracottaViewController.h"
-// #import "TerracottaManager.h"
-// #import "TerracottaBridge.h"
+// Terracotta 联机已恢复；ZeroTier 仍保持禁用。
+#import "TerracottaViewController.h"
 #import "AccountListViewController.h"
 
 // 布局常量（iPad/宽屏基准值；iPhone 上通过 traitCollection 适配后会变窄）
@@ -419,15 +416,10 @@ static CGFloat LauncherCardLayoutRightPanelWidth(UITraitCollection *trait) {
                                              selector:@selector(showSettings)
                                                  name:@"ShowSettings"
                                                object:nil];
-    // ZeroTier/Terracotta 联机暂时移除（排查启动崩溃）
-    // [[NSNotificationCenter defaultCenter] addObserver:self
-    //                                          selector:@selector(showMultiplayer)
-    //                                              name:@"ShowMultiplayer"
-    //                                            object:nil];
-    // [[NSNotificationCenter defaultCenter] addObserver:self
-    //                                          selector:@selector(showZeroTier)
-    //                                              name:@"ShowZeroTier"
-    //                                            object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(showMultiplayer)
+                                                 name:@"ShowMultiplayer"
+                                               object:nil];
     // 账户管理：右侧面板点击头像会发 ShowAccountManager 通知。
     // 原实现遗漏此监听，导致卡片布局下点头像无反应、无法登录账号。
     [[NSNotificationCenter defaultCenter] addObserver:self
@@ -570,22 +562,11 @@ static CGFloat LauncherCardLayoutRightPanelWidth(UITraitCollection *trait) {
     [self setContentViewController:navVC animated:YES];
 }
 
-// ZeroTier/Terracotta 联机暂时移除（排查启动崩溃）
-// - (void)showMultiplayer { ... TerracottaViewController ... }
-// - (void)showZeroTier { ... MultiplayerViewController ... TerracottaManager ... }
 - (void)showMultiplayer {
-    [self showMultiplayerDisabledAlert];
-}
-- (void)showZeroTier {
-    [self showMultiplayerDisabledAlert];
-}
-- (void)showMultiplayerDisabledAlert {
-    UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"联机功能暂时不可用"
-                          message:@"联机模块（ZeroTier/Terracotta）正在排查启动崩溃问题，暂时禁用，请等待后续版本恢复。"
-                   preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-    [self presentViewController:alert animated:YES completion:nil];
+    TerracottaViewController *vc = [[TerracottaViewController alloc] init];
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+    nav.navigationBar.prefersLargeTitles = NO;
+    [self setContentViewController:nav animated:YES];
 }
 
 - (void)showAccountManager {

@@ -271,7 +271,11 @@
             [self showVersionManager];
             break;
 
-        case 3: // 设置（联机入口暂时移除，恢复时将本 case 改回 case 5）
+        case 3: // 陶瓦联机
+            [self showMultiplayer];
+            break;
+
+        case 4: // 设置
             [self showSettings];
             break;
     }

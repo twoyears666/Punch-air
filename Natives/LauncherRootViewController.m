@@ -16,11 +16,8 @@
 #import "ModpackImportViewController.h"
 #import "LauncherPrefGameDirViewController.h"
 #import "CustomControlsViewController.h"
-// ZeroTier/Terracotta 联机暂时移除（排查启动崩溃）
-// #import "MultiplayerViewController.h"
-// #import "TerracottaViewController.h"
-// #import "TerracottaManager.h"
-// #import "TerracottaBridge.h"
+// Terracotta 联机已恢复；ZeroTier 仍保持禁用。
+#import "TerracottaViewController.h"
 #import "AccountListViewController.h"
 
 // 布局常量（iPad 基准值；iPhone 上通过 LauncherRootLayoutWidth 适配后会变窄）
@@ -334,15 +331,10 @@ static CGFloat LauncherRootLayoutRightPanelWidth(UITraitCollection *trait) {
                                              selector:@selector(showSettings)
                                                  name:@"ShowSettings"
                                                object:nil];
-    // ZeroTier/Terracotta 联机暂时移除（排查启动崩溃）
-    // [[NSNotificationCenter defaultCenter] addObserver:self
-    //                                          selector:@selector(showMultiplayer)
-    //                                              name:@"ShowMultiplayer"
-    //                                            object:nil];
-    // [[NSNotificationCenter defaultCenter] addObserver:self
-    //                                          selector:@selector(showZeroTier)
-    //                                              name:@"ShowZeroTier"
-    //                                            object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(showMultiplayer)
+                                                 name:@"ShowMultiplayer"
+                                               object:nil];
     // 首页快捷瓷砖触发：切到对应内容区子页面（不再 FormSheet 弹窗）
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(showModsManager)
@@ -484,22 +476,11 @@ static CGFloat LauncherRootLayoutRightPanelWidth(UITraitCollection *trait) {
     [self setContentViewController:navVC animated:YES];
 }
 
-// ZeroTier/Terracotta 联机暂时移除（排查启动崩溃）
-// - (void)showMultiplayer { ... TerracottaViewController ... }
-// - (void)showZeroTier { ... MultiplayerViewController ... TerracottaManager ... }
 - (void)showMultiplayer {
-    [self showMultiplayerDisabledAlert];
-}
-- (void)showZeroTier {
-    [self showMultiplayerDisabledAlert];
-}
-- (void)showMultiplayerDisabledAlert {
-    UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"联机功能暂时不可用"
-                          message:@"联机模块（ZeroTier/Terracotta）正在排查启动崩溃问题，暂时禁用，请等待后续版本恢复。"
-                   preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-    [self presentViewController:alert animated:YES completion:nil];
+    TerracottaViewController *vc = [[TerracottaViewController alloc] init];
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+    nav.navigationBar.prefersLargeTitles = NO;
+    [self setContentViewController:nav animated:YES];
 }
 
 #pragma mark - 首页快捷入口 (替换原 FormSheet 弹窗)
