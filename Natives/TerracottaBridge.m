@@ -6,6 +6,7 @@ NSString * const TerracottaStateDidChangeNotification = @"TerracottaStateDidChan
 @interface TerracottaBridge ()
 @property(nonatomic, strong) dispatch_source_t stateTimer;
 @property(nonatomic, copy) NSDictionary *lastState;
+@property(nonatomic, assign) BOOL initialized;
 @end
 
 @implementation TerracottaBridge
@@ -24,17 +25,27 @@ NSString * const TerracottaStateDidChangeNotification = @"TerracottaStateDidChan
 }
 
 - (void)start {
-    if (![self isAvailable] || self.stateTimer) return;
+    if (![self isAvailable]) return;
 
-    const char *home = getenv("POJAV_HOME");
-    if (!home || home[0] == '\0') {
-        NSLog(@"[Terracotta] POJAV_HOME is unavailable");
-        return;
+    // libterracotta 要求每个进程只初始化一次。结束会话只回到 waiting，
+    // 再次打开页面不能重复调用 terracotta_ios_start。
+    if (!self.initialized) {
+        const char *home = getenv("POJAV_HOME");
+        if (!home || home[0] == '\0') {
+            NSLog(@"[Terracotta] POJAV_HOME is unavailable");
+            return;
+        }
+
+        int result = terracotta_ios_start(home, -1);
+        NSLog(@"[Terracotta] initialized: %d", result);
+        if (result != 0) return;
+        self.initialized = YES;
     }
 
-    int result = terracotta_ios_start(home, -1);
-    NSLog(@"[Terracotta] initialized: %d", result);
-    if (result != 0) return;
+    if (self.stateTimer) {
+        [self pollState];
+        return;
+    }
 
     self.lastState = @{};
     dispatch_queue_t queue = dispatch_get_main_queue();
@@ -52,22 +63,21 @@ NSString * const TerracottaStateDidChangeNotification = @"TerracottaStateDidChan
 }
 
 - (void)stop {
+    if ([self isAvailable] && self.initialized) {
+        terracotta_ios_set_waiting();
+        [self pollState];
+    }
+}
+
+- (void)dealloc {
     if (self.stateTimer) {
         dispatch_source_cancel(self.stateTimer);
         self.stateTimer = nil;
     }
-    if ([self isAvailable]) {
-        terracotta_ios_set_waiting();
-    }
-    self.lastState = nil;
-}
-
-- (void)dealloc {
-    [self stop];
 }
 
 - (NSDictionary *)currentState {
-    if (![self isAvailable]) return @{};
+    if (![self isAvailable] || !self.initialized) return @{};
     char *json = terracotta_ios_get_state();
     if (!json) return @{};
     NSData *data = [NSData dataWithBytes:json length:strlen(json)];

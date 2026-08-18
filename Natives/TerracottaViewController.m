@@ -239,7 +239,6 @@
 
 - (void)stopSession {
     [TerracottaManager.sharedManager stop];
-    [TerracottaManager.sharedManager start];
     [self renderState:TerracottaManager.sharedManager.state];
 }
 
