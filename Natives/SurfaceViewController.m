@@ -297,6 +297,15 @@ static GameSurfaceView* pojavWindow;
 @property(nonatomic, assign) BOOL launchOverlayDismissed;
 @property(nonatomic, strong) UIButton *launchCancelButton;     // 取消启动按钮
 
+// 台前调度/Stage Manager 在短时间内可能连续触发布局过渡。
+// 将窗口尺寸提交合并到过渡完成后，避免渲染线程与 UIKit 同时改动窗口状态。
+@property(nonatomic, assign) BOOL resolutionUpdateScheduled;
+@property(nonatomic, assign) BOOL isTransitioningWindowSize;
+@property(nonatomic, assign) NSUInteger windowTransitionGeneration;
+@property(nonatomic, assign) BOOL hasSubmittedWindowSize;
+@property(nonatomic, assign) int lastSubmittedWindowWidth;
+@property(nonatomic, assign) int lastSubmittedWindowHeight;
+
 @end
 
 @implementation SurfaceViewController
@@ -1293,6 +1302,24 @@ static GameSurfaceView* pojavWindow;
 }
 
 - (void)updateSavedResolution {
+    if (![NSThread isMainThread]) {
+        if (!self.resolutionUpdateScheduled) {
+            self.resolutionUpdateScheduled = YES;
+            __weak typeof(self) weakSelf = self;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                __strong typeof(weakSelf) strongSelf = weakSelf;
+                strongSelf.resolutionUpdateScheduled = NO;
+                [strongSelf updateSavedResolution];
+            });
+        }
+        return;
+    }
+
+    // 不要在 UIKit 的尺寸过渡动画中改动渲染窗口；完成回调会统一提交一次。
+    if (self.isTransitioningWindowSize) {
+        return;
+    }
+
     for (UIWindowScene *scene in UIApplication.sharedApplication.connectedScenes.allObjects) {
         self.screenScale = scene.screen.scale;
         if (scene.session.role != UIWindowSceneSessionRoleApplication) {
@@ -1301,7 +1328,10 @@ static GameSurfaceView* pojavWindow;
     }
 
     if (self.surfaceView.superview != nil) {
-        self.surfaceView.frame = self.surfaceView.superview.frame;
+        CGRect surfaceBounds = self.surfaceView.superview.bounds;
+        if (!CGRectEqualToRect(self.surfaceView.frame, surfaceBounds)) {
+            self.surfaceView.frame = surfaceBounds;
+        }
     }
 
     resolutionScale = getPrefFloat(@"video.resolution") / 100.0;
@@ -1346,7 +1376,17 @@ static GameSurfaceView* pojavWindow;
                   metalLayer.contentsScale);
         }
     }
-    CallbackBridge_nativeSendScreenSize(windowWidth, windowHeight);
+    // 26.2 在台前调度调整窗口时可能重复回调同一尺寸。
+    // GLFW 侧不需要重复 set size，重复提交会与 UIKit/CoreGraphics 的布局事务竞争。
+    BOOL sizeChanged = !self.hasSubmittedWindowSize ||
+        self.lastSubmittedWindowWidth != windowWidth ||
+        self.lastSubmittedWindowHeight != windowHeight;
+    if (sizeChanged) {
+        self.hasSubmittedWindowSize = YES;
+        self.lastSubmittedWindowWidth = windowWidth;
+        self.lastSubmittedWindowHeight = windowHeight;
+        CallbackBridge_nativeSendScreenSize(windowWidth, windowHeight);
+    }
 }
 
 - (void)updateControlHiddenState:(BOOL)hide {
@@ -1729,6 +1769,8 @@ static GameSurfaceView* pojavWindow;
 
 - (void)viewWillTransitionToSize:(CGSize)size withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator
 {
+    NSUInteger transitionGeneration = ++self.windowTransitionGeneration;
+    self.isTransitioningWindowSize = YES;
     [coordinator animateAlongsideTransition:^(id<UIViewControllerTransitionCoordinatorContext>  _Nonnull context) {
         self.rootView.bounds = CGRectMake(0, 0, size.width + 30.0, size.height);
 
@@ -1740,10 +1782,18 @@ static GameSurfaceView* pojavWindow;
         [self viewWillTransitionToSize_Navigation:frame];
         self.ctrlView.frame = getSafeArea(self.view.frame);
         [self.ctrlView.subviews makeObjectsPerformSelector:@selector(update)];
-        [self updateSavedResolution];
         [GyroInput updateOrientation];
     } completion:^(id<UIViewControllerTransitionCoordinatorContext>  _Nonnull context) {
         virtualMouseFrame = self.mousePointerView.frame;
+        if (transitionGeneration != self.windowTransitionGeneration) {
+            return;
+        }
+        self.isTransitioningWindowSize = NO;
+        // 等 UIKit 完成最终布局后再提交一次渲染尺寸，避免 26.2 的重复布局竞态。
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self.view layoutIfNeeded];
+            [self updateSavedResolution];
+        });
     }];
     [super viewWillTransitionToSize:size withTransitionCoordinator:coordinator];
 }
