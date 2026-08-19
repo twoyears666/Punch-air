@@ -46,16 +46,15 @@
     // 联机相关入口暂不显示（需进一步完善）
     // case 3 为"联机"（陶瓦联机 Terracotta，与 HMCL/FCL/ZL2 互通）
     // case 4 为"ZeroTier 联机"（独立入口，与陶瓦联机并列，便于用户直接进入 ZeroTier 界面）
-    // case 5 为"设置"
+    // case 4 为"设置"
     // 键位调整界面已移到设置页面中
     self.menuItems = @[
         @{@"icon": @"house.fill", @"title": @" ", @"index": @0},
         @{@"icon": @"arrow.down.circle.fill", @"title": @" ", @"index": @1},
         @{@"icon": @"puzzlepiece.fill", @"title": @" ", @"index": @2},
-        // 暂时移除两个联机图标，恢复时取消下方两行注释并将设置项 index 改回 @5
-        // @{@"icon": @"antenna.radiowaves.left.and.right", @"title": @" ", @"index": @3},
-        // @{@"icon": @"network", @"title": @" ", @"index": @4},
-        @{@"icon": @"gearshape.fill", @"title": @" ", @"index": @3}
+        // 陶瓦联机独立入口，设置保留为最后一项
+        @{@"icon": @"antenna.radiowaves.left.and.right", @"title": @" ", @"index": @3},
+        @{@"icon": @"gearshape.fill", @"title": @" ", @"index": @4}
     ];
     
     self.selectedIndex = 0;
