@@ -256,6 +256,11 @@ static GameSurfaceView* pojavWindow;
     shouldTriggerClick, shouldTriggerHaptic, slideableHotbar, toggleHidden;
 
 @property(nonatomic) BOOL enableMouseGestures, enableHotbarGestures;
+// M1: Last UIKit surface size applied during Stage Manager resizing.
+@property(nonatomic, assign) CGSize lastSurfaceLayoutSize;
+// M2: Publish one renderer size after interactive resizing settles.
+@property(nonatomic, assign) CGSize pendingRendererLayoutSize;
+@property(nonatomic, assign) CGSize lastPublishedRendererSize;
 
 @property(nonatomic) UIImpactFeedbackGenerator *lightHaptic;
 @property(nonatomic) UIImpactFeedbackGenerator *mediumHaptic;
@@ -1199,10 +1204,69 @@ static GameSurfaceView* pojavWindow;
 
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
+
     // 更新启动遮罩层渐变背景的 frame（旋转/尺寸变化时）
     if (self.launchGradientLayer && self.launchOverlayView) {
         self.launchGradientLayer.frame = self.launchOverlayView.bounds;
     }
+
+    CGSize size = self.view.bounds.size;
+    if (self.surfaceView == nil
+            || size.width <= 0.0
+            || size.height <= 0.0
+            || CGSizeEqualToSize(size, self.lastSurfaceLayoutSize)) {
+        return;
+    }
+
+    self.lastSurfaceLayoutSize = size;
+    NSLog(@"[StageManager][M1] UIKit layout %.0fx%.0f pt", size.width, size.height);
+
+    // Keep Amethyst's +30pt root container workaround, while the visible
+    // touch and game surfaces use the exact Stage Manager window bounds.
+    self.rootView.frame = CGRectMake(0.0, 0.0, size.width + 30.0, size.height);
+    self.rootView.bounds = CGRectMake(0.0, 0.0, size.width + 30.0, size.height);
+    self.touchView.frame = CGRectMake(0.0, 0.0, size.width, size.height);
+    self.surfaceView.frame = self.touchView.bounds;
+
+    // Keep input coordinates, safe-area controls, navigation and the floating
+    // menu aligned with the same visible bounds as the game surface.
+    self.inputTextField.frame = CGRectMake(0.0, -32.0, size.width, 30.0);
+    self.ctrlView.frame = getSafeArea(self.view.bounds);
+    [self.ctrlView.subviews makeObjectsPerformSelector:@selector(update)];
+    [self viewWillTransitionToSize_Navigation:self.view.bounds];
+
+    if (self.gameMenuOverlay != nil) {
+        self.gameMenuOverlay.frame = self.view.bounds;
+        [self.gameMenuOverlay setNeedsLayout];
+    }
+
+    self.pendingRendererLayoutSize = size;
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(commitPendingRendererSize) object:nil];
+    [self performSelector:@selector(commitPendingRendererSize)
+               withObject:nil
+               afterDelay:0.20
+                  inModes:@[NSRunLoopCommonModes]];
+}
+
+- (void)commitPendingRendererSize {
+    CGSize currentSize = self.view.bounds.size;
+    if (currentSize.width <= 0.0 || currentSize.height <= 0.0) {
+        return;
+    }
+
+    // If layout changed again after the timer fired, wait for the next stable tick.
+    if (!CGSizeEqualToSize(currentSize, self.pendingRendererLayoutSize)) {
+        self.pendingRendererLayoutSize = currentSize;
+        [self performSelector:@selector(commitPendingRendererSize)
+                   withObject:nil
+                   afterDelay:0.20
+                      inModes:@[NSRunLoopCommonModes]];
+        return;
+    }
+
+    NSLog(@"[StageManager][M2] Stable window %.0fx%.0f pt; publishing renderer size",
+          currentSize.width, currentSize.height);
+    [self updateSavedResolution];
 }
 
 - (void)updateAudioSettings {
@@ -1346,7 +1410,13 @@ static GameSurfaceView* pojavWindow;
                   metalLayer.contentsScale);
         }
     }
-    CallbackBridge_nativeSendScreenSize(windowWidth, windowHeight);
+    CGSize rendererSize = CGSizeMake(windowWidth, windowHeight);
+    if (!CGSizeEqualToSize(rendererSize, self.lastPublishedRendererSize)) {
+        self.lastPublishedRendererSize = rendererSize;
+        NSLog(@"[StageManager][M2] Renderer size %dx%d px (scale=%.2f, resolution=%.2f)",
+              windowWidth, windowHeight, self.screenScale, resolutionScale);
+        CallbackBridge_nativeSendScreenSize(windowWidth, windowHeight);
+    }
 }
 
 - (void)updateControlHiddenState:(BOOL)hide {
@@ -1736,11 +1806,9 @@ static GameSurfaceView* pojavWindow;
         frame.size = size;
         self.touchView.frame = frame;
         self.inputTextField.frame = CGRectMake(0, -32.0, size.width, 30.0);
-        [self viewWillTransitionToSize_LogView:frame];
         [self viewWillTransitionToSize_Navigation:frame];
         self.ctrlView.frame = getSafeArea(self.view.frame);
         [self.ctrlView.subviews makeObjectsPerformSelector:@selector(update)];
-        [self updateSavedResolution];
         [GyroInput updateOrientation];
     } completion:^(id<UIViewControllerTransitionCoordinatorContext>  _Nonnull context) {
         virtualMouseFrame = self.mousePointerView.frame;
