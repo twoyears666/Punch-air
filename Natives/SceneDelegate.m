@@ -19,14 +19,9 @@ extern UIWindow *mainWindow;
 - (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session options:(UISceneConnectionOptions *)connectionOptions {
     UIWindowScene *windowScene = (UIWindowScene *)scene;
     
-    // 强制横屏 (iOS 16+)
-    if (@available(iOS 16.0, *)) {
-        UIWindowSceneGeometryPreferencesIOS *geometryPreferences = [[UIWindowSceneGeometryPreferencesIOS alloc] init];
-        geometryPreferences.interfaceOrientations = UIInterfaceOrientationMaskLandscape;
-        [windowScene requestGeometryUpdateWithPreferences:geometryPreferences errorHandler:^(NSError *error) {
-            NSLog(@"[SceneDelegate] Failed to update geometry: %@", error);
-        }];
-    }
+    // M1 / Action #18: Keep the system-provided scene geometry.
+    // A landscape-only geometry request prevents iPadOS Stage Manager from
+    // offering its full set of freely resizable window aspect ratios.
     
     self.window = [[UIWindow alloc] initWithWindowScene:windowScene];
     self.window.frame = windowScene.coordinateSpace.bounds;
@@ -125,6 +120,11 @@ extern UIWindow *mainWindow;
 #pragma mark - Orientation Support (iOS 16+)
 
 - (UIInterfaceOrientationMask)scene:(UIScene *)scene supportedInterfaceOrientationsForWindowScene:(UIWindowScene *)windowScene API_AVAILABLE(ios(16.0)) {
+    // iPad accepts both portrait and landscape scene geometries for Stage Manager.
+    // Keep the existing landscape-only behaviour on iPhone.
+    if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad) {
+        return UIInterfaceOrientationMaskAll;
+    }
     return UIInterfaceOrientationMaskLandscape;
 }
 
