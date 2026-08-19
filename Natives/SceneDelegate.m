@@ -19,15 +19,8 @@ extern UIWindow *mainWindow;
 - (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session options:(UISceneConnectionOptions *)connectionOptions {
     UIWindowScene *windowScene = (UIWindowScene *)scene;
     
-    // 强制横屏 (iOS 16+)
-    if (@available(iOS 16.0, *)) {
-        UIWindowSceneGeometryPreferencesIOS *geometryPreferences = [[UIWindowSceneGeometryPreferencesIOS alloc] init];
-        geometryPreferences.interfaceOrientations = UIInterfaceOrientationMaskLandscape;
-        [windowScene requestGeometryUpdateWithPreferences:geometryPreferences errorHandler:^(NSError *error) {
-            NSLog(@"[SceneDelegate] Failed to update geometry: %@", error);
-        }];
-    }
-    
+    // 保留系统/台前调度对窗口尺寸和方向的管理，不主动请求几何更新。
+
     self.window = [[UIWindow alloc] initWithWindowScene:windowScene];
     self.window.frame = windowScene.coordinateSpace.bounds;
     // 修复：使用 systemBackgroundColor 自适应浅色/深色模式。

@@ -7,10 +7,7 @@
 #import "TrackedTextField.h"
 #import "utils.h"
 #import "ScreenUtils.h"
-// ZeroTier/Terracotta 联机暂时移除（排查启动崩溃）
-// #import "MultiplayerViewController.h"
-// #import "MultiplayerManager.h"
-// #import "TerracottaViewController.h"
+#import "TerracottaViewController.h"
 #import <objc/runtime.h>
 
 // 暴露 class extension 中的私有属性，供 category 使用
@@ -252,14 +249,14 @@ static const void *kMenuDimViewKey = &kMenuDimViewKey;
 /// 选择当房主（创建世界→开放局域网→输入端口→生成邀请码）
 /// 或当房客（输入邀请码→加入网络→MC 多人游戏直连 127.0.0.1:25565）。
 - (void)actionOpenMultiplayer {
-    // ZeroTier/Terracotta 联机暂时移除（排查启动崩溃）
     [self dismissMenu];
-    UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"联机功能暂时不可用"
-                          message:@"联机模块（ZeroTier/Terracotta）正在排查启动崩溃问题，暂时禁用，请等待后续版本恢复。"
-                   preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-    [self presentViewController:alert animated:YES completion:nil];
+
+    /* 游戏内悬浮球直接打开与启动器相同的陶瓦联机设置页。 */
+    TerracottaViewController *terracottaVC = [[TerracottaViewController alloc] init];
+    UINavigationController *navigationController =
+        [[UINavigationController alloc] initWithRootViewController:terracottaVC];
+    navigationController.modalPresentationStyle = UIModalPresentationPageSheet;
+    [self presentViewController:navigationController animated:YES completion:nil];
 }
 
 /// FCL 风格：隐藏/显示控制按钮（对应 FCL hide_all 开关）
