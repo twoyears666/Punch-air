@@ -1221,6 +1221,7 @@ static GameSurfaceView* pojavWindow;
     }
 
     self.lastSurfaceLayoutSize = size;
+    // M4 / Action #21: Verification logs for UIKit, stable-window and renderer sizes.
     NSLog(@"[StageManager][M1] UIKit layout %.0fx%.0f pt", size.width, size.height);
 
     // Keep Amethyst's +30pt root container workaround, while the visible
