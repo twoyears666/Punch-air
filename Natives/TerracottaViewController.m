@@ -4,7 +4,6 @@
 #import "LauncherPreferences.h"
 #import "utils.h"
 #import "BackgroundManager.h"
-#import "MultiplayerViewController.h"
 
 /// FCL 风格的陶瓦联机界面（完美适配自定义启动器背景）
 ///
@@ -621,11 +620,12 @@
 }
 
 - (void)presentZeroTierVC {
-    MultiplayerViewController *vc = [[MultiplayerViewController alloc] init];
-    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
-    nav.modalPresentationStyle = UIModalPresentationPageSheet;
-    /* 如果当前是 push 进的 nav 栈，用 present 覆盖；如果是 modal，直接 present */
-    [self presentViewController:nav animated:YES completion:nil];
+    UIAlertController *alert = [UIAlertController
+        alertControllerWithTitle:@"ZeroTier 联机暂不可用"
+                          message:@"当前构建已启用陶瓦联机。ZeroTier 旧入口依赖未随本构建启用的组件，请使用陶瓦联机页面。"
+                   preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
 }
 
 #pragma mark - Player Name
