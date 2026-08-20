@@ -164,9 +164,14 @@ void init_loadMobileGluesConfig() {
     NSString *renderer = [PLProfiles resolveKeyForCurrentProfile:@"renderer"];
     NSLog(@"[JavaLauncher] init_loadMobileGluesConfig: renderer=%@", renderer);
 
+    // Modern Java versions may safely fall back to MobileGlues later in launchJVM.
+    // Pre-write its config for those profiles too; unused config files are harmless.
     BOOL usesMobileGlues = [renderer isEqualToString:@ RENDERER_NAME_MOBILEGLUES] ||
         [renderer isEqualToString:@"auto"] ||
-        [renderer isEqualToString:@ RENDERER_NAME_VULKAN];
+        [renderer isEqualToString:@ RENDERER_NAME_VULKAN] ||
+        [renderer isEqualToString:@ RENDERER_NAME_GL4ES] ||
+        [renderer isEqualToString:@ RENDERER_NAME_MTL_ANGLE] ||
+        [renderer isEqualToString:@ RENDERER_NAME_VK_ZINK];
 
     if (!usesMobileGlues) {
         NSLog(@"[JavaLauncher] MobileGlues config not written (renderer is not mobileglues/auto/vulkan)");
@@ -450,10 +455,21 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
 
         // Setup AMETHYST_RENDERER
         NSString *renderer = [PLProfiles resolveKeyForCurrentProfile:@"renderer"];
-        // GL4ES 的硬件扩展探测在 iOS 上依赖旧式 GL 状态；在 Java 17+ / 1.21+
-        // 的 GLFW 创建上下文阶段可能直接调用空函数指针（GetHardwareExtensions）。
-        // 现代版本统一使用 ANGLE 作为兼容 OpenGL 后端，旧版 Java 保留用户选择。
-        if (minVersion >= 17 && [renderer isEqualToString:@ RENDERER_NAME_GL4ES]) {
+        // Java 21 / Minecraft 1.21.x compatibility:
+        // - ANGLE and OSMesa can create an incomplete framebuffer on this iOS path.
+        // - OSMesa can also race CoreAnimation while resizing/presenting.
+        // MobileGlues is the stable backend confirmed by the same launch logs.
+        // Keep explicit legacy choices for Java 8/17, but use the stable backend for Java 21+.
+        BOOL unstableModernRenderer =
+            [renderer isEqualToString:@"auto"] ||
+            [renderer isEqualToString:@ RENDERER_NAME_GL4ES] ||
+            [renderer isEqualToString:@ RENDERER_NAME_MTL_ANGLE] ||
+            [renderer isEqualToString:@ RENDERER_NAME_VK_ZINK];
+        if (minVersion >= 21 && unstableModernRenderer) {
+            NSLog(@"[JavaLauncher] Renderer %@ is unstable on Java %d; falling back to MobileGlues",
+                  renderer, minVersion);
+            renderer = @ RENDERER_NAME_MOBILEGLUES;
+        } else if (minVersion >= 17 && [renderer isEqualToString:@ RENDERER_NAME_GL4ES]) {
             NSLog(@"[JavaLauncher] GL4ES is unsafe on Java %d; falling back to ANGLE", minVersion);
             renderer = @ RENDERER_NAME_MTL_ANGLE;
         }
