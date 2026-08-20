@@ -32,6 +32,7 @@ static const CGFloat kDragThreshold = 10.0;
 @property (nonatomic, assign) BOOL isDragging;
 @property (nonatomic, assign) CGPoint dragStartPoint;
 @property (nonatomic, assign) CGPoint dragStartCenter;
+@property (nonatomic, assign) CGSize lastLayoutSize;
 
 @end
 
@@ -335,7 +336,20 @@ static const CGFloat kDragThreshold = 10.0;
 
 - (void)layoutSubviews {
     [super layoutSubviews];
-    // 屏幕旋转后重新约束位置
+
+    CGSize currentSize = self.bounds.size;
+    CGSize previousSize = self.lastLayoutSize;
+    if (previousSize.width > 0.0 && previousSize.height > 0.0 &&
+        currentSize.width > 0.0 && currentSize.height > 0.0 &&
+        !CGSizeEqualToSize(previousSize, currentSize)) {
+        CGFloat scaleX = currentSize.width / previousSize.width;
+        CGFloat scaleY = currentSize.height / previousSize.height;
+        self.menuButton.center = CGPointMake(self.menuButton.center.x * scaleX,
+                                             self.menuButton.center.y * scaleY);
+        self.statsLabel.center = CGPointMake(self.statsLabel.center.x * scaleX,
+                                              self.statsLabel.center.y * scaleY);
+    }
+    self.lastLayoutSize = currentSize;
     [self clampViewsToScreen];
 }
 

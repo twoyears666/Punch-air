@@ -41,8 +41,7 @@ NSNotificationName TerracottaManagerStateDidChangeNotification = @"TerracottaMan
         _role = TerracottaRoleNone;
         _pollQueue = dispatch_queue_create("terracotta.poll", dispatch_queue_attr_make_with_qos_class(
             DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
-        /* 单例触发 init 时自动初始化 Terracotta（若库可用） */
-        [self initializeTerracotta];
+        /* 不在单例构造期间启动 Rust 核心，避免普通启动流程触发联机库。 */
     }
     return self;
 }
@@ -78,11 +77,25 @@ NSNotificationName TerracottaManagerStateDidChangeNotification = @"TerracottaMan
     self.initialized = YES;
 }
 
+- (BOOL)ensureInitialized {
+    if (!self.initialized) [self initializeTerracotta];
+    if (self.initialized) return YES;
+
+    if (self.lastError.length == 0) {
+        self.lastError = @"陶瓦联机当前不可用";
+    }
+    self.status = TerracottaStatusError;
+    self.stageDescription = self.lastError;
+    [self notifyStateChanged];
+    return NO;
+}
+
 #pragma mark - Session Control
 
 - (void)createRoomWithPort:(uint16_t)port
                 inviteCode:(NSString *)inviteCode
                 playerName:(NSString *)playerName {
+    if (![self ensureInitialized]) return;
     [self resetSessionState];
     self.role = TerracottaRoleHost;
     self.currentPort = port;
@@ -109,6 +122,7 @@ NSNotificationName TerracottaManagerStateDidChangeNotification = @"TerracottaMan
 
 - (BOOL)joinRoomWithInviteCode:(NSString *)inviteCode
                     playerName:(NSString *)playerName {
+    if (![self ensureInitialized]) return NO;
     if (![TerracottaBridge verifyRoomCode:inviteCode]) {
         self.lastError = @"邀请码格式不正确";
         return NO;

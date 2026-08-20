@@ -38,17 +38,29 @@ static void terracottaCallWithOptionalCString(NSString *s, void (^body)(const ch
         NSLog(@"[TerracottaBridge] libterracotta not linked, start ignored");
         return NO;
     }
-    int fd = -1;
-    if (loggingPath != nil) {
-        /* C 标准八进制：O_WRONLY=01, O_CREAT=0100, O_TRUNC=01000, O_APPEND=02000, mode=0644
-         * 注意：不能用 C++14 的 0o 前缀（C 语言不支持，AppleClang 会报 invalid suffix） */
-        fd = open([loggingPath UTF8String], 02000 | 0100 | 01000, 0644);
+    if (workingDirectory.length == 0) {
+        NSLog(@"[TerracottaBridge] working directory is empty");
+        return NO;
     }
-    @try {
-        return terracotta_ios_start([workingDirectory UTF8String], fd) == 0 ? YES : NO;
-    } @finally {
-        if (fd >= 0) close(fd);
-    }
+
+    /* Rust 核心明确要求每个进程只初始化一次。用 dispatch_once 在桥接层兜底，
+     * 即使未来出现第二个调用入口，也不会重复执行 terracotta_ios_start。 */
+    static dispatch_once_t onceToken;
+    static BOOL startResult = NO;
+    dispatch_once(&onceToken, ^{
+        int fd = -1;
+        if (loggingPath != nil) {
+            /* C 标准八进制：O_WRONLY=01, O_CREAT=0100, O_TRUNC=01000, O_APPEND=02000, mode=0644
+             * 注意：不能用 C++14 的 0o 前缀（C 语言不支持，AppleClang 会报 invalid suffix） */
+            fd = open([loggingPath UTF8String], 02000 | 0100 | 01000, 0644);
+        }
+        @try {
+            startResult = terracotta_ios_start([workingDirectory UTF8String], fd) == 0 ? YES : NO;
+        } @finally {
+            if (fd >= 0) close(fd);
+        }
+    });
+    return startResult;
 }
 
 + (void)setWaiting {

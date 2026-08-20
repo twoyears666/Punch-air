@@ -40,7 +40,7 @@ typedef NS_ENUM(NSInteger, TerracottaStateKind) {
 /// 运行时检查 libterracotta 是否链接。未链接时所有调用安全降级。
 + (BOOL)isAvailable;
 
-/// 初始化 Terracotta。App 启动时调用一次。
+/// 初始化 Terracotta。首次打开联机界面时调用；进程生命周期内最多执行一次。
 + (BOOL)startWithWorkingDirectory:(NSString *)workingDirectory
                        loggingPath:(nullable NSString *)loggingPath;
 

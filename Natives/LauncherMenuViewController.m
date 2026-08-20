@@ -52,10 +52,9 @@
         @{@"icon": @"house.fill", @"title": @" ", @"index": @0},
         @{@"icon": @"arrow.down.circle.fill", @"title": @" ", @"index": @1},
         @{@"icon": @"puzzlepiece.fill", @"title": @" ", @"index": @2},
-        // 暂时移除两个联机图标，恢复时取消下方两行注释并将设置项 index 改回 @5
-        // @{@"icon": @"antenna.radiowaves.left.and.right", @"title": @" ", @"index": @3},
-        // @{@"icon": @"network", @"title": @" ", @"index": @4},
-        @{@"icon": @"gearshape.fill", @"title": @" ", @"index": @3}
+        // 陶瓦联机独立入口，设置保留为最后一项
+        @{@"icon": @"antenna.radiowaves.left.and.right", @"title": @" ", @"index": @3},
+        @{@"icon": @"gearshape.fill", @"title": @" ", @"index": @4}
     ];
     
     self.selectedIndex = 0;
@@ -271,7 +270,11 @@
             [self showVersionManager];
             break;
 
-        case 3: // 设置（联机入口暂时移除，恢复时将本 case 改回 case 5）
+        case 3: // 陶瓦联机
+            [self showMultiplayer];
+            break;
+
+        case 4: // 设置
             [self showSettings];
             break;
     }

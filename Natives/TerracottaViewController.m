@@ -88,12 +88,35 @@
         self.navigationItem.leftBarButtonItem = closeItem;
     }
 
+    /* ZeroTier 联机入口：始终使用浮动按钮放置在视图右上角
+       （导航栏可见时也保留，确保 modal/pushed 模式下可访问） */
+    UIButton *ztFab = [UIButton buttonWithType:UIButtonTypeSystem];
+    [ztFab setImage:[UIImage systemImageNamed:@"network"] forState:UIControlStateNormal];
+    ztFab.tintColor = [UIColor whiteColor];
+    ztFab.backgroundColor = [UIColor systemBlueColor];
+    ztFab.layer.cornerRadius = 18;
+    ztFab.layer.masksToBounds = YES;
+    ztFab.translatesAutoresizingMaskIntoConstraints = NO;
+    ztFab.accessibilityLabel = @"ZeroTier 联机";
+    [ztFab addTarget:self action:@selector(switchToZeroTier:) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:ztFab];
+    [self.view bringSubviewToFront:ztFab];
+    [NSLayoutConstraint activateConstraints:@[
+        [ztFab.widthAnchor constraintEqualToConstant:36],
+        [ztFab.heightAnchor constraintEqualToConstant:36],
+        [ztFab.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:8],
+        [ztFab.trailingAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.trailingAnchor constant:-16],
+    ]];
 
     /* 适配自定义启动器背景：透明化 VC，让全局背景图/毛玻璃透出 */
     [[BackgroundManager sharedManager] makeViewControllerTransparent:self];
 
     [self setupViews];
     [self registerNotifications];
+
+    /* 懒加载：只有用户真正打开陶瓦联机页面时才启动 Rust 核心。 */
+    [[TerracottaManager shared] initializeTerracotta];
+
     [self applyBackgroundEffects];
     [self refreshUI];
 }
@@ -601,12 +624,17 @@
 }
 
 - (void)presentZeroTierVC {
-    UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"ZeroTier 联机暂不可用"
-                          message:@"当前构建已启用陶瓦联机。ZeroTier 旧入口依赖未随本构建启用的组件，请使用陶瓦联机页面。"
-                   preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
-    [self presentViewController:alert animated:YES completion:nil];
+    /* ZeroTier 当前可能未参与编译，用运行时查找避免产生硬链接依赖。 */
+    Class multiplayerClass = NSClassFromString(@"MultiplayerViewController");
+    if (multiplayerClass == Nil) {
+        [self showToast:@"当前构建未启用 ZeroTier 联机"];
+        return;
+    }
+    UIViewController *vc = [[multiplayerClass alloc] init];
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+    nav.modalPresentationStyle = UIModalPresentationPageSheet;
+    /* 如果当前是 push 进的 nav 栈，用 present 覆盖；如果是 modal，直接 present */
+    [self presentViewController:nav animated:YES completion:nil];
 }
 
 #pragma mark - Player Name

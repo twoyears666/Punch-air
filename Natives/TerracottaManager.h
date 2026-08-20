@@ -39,7 +39,7 @@ extern NSNotificationName TerracottaManagerStateDidChangeNotification;
 @property(nonatomic, readonly, nullable) NSString *lastError;
 @property(nonatomic, readonly) BOOL initialized;
 
-/// App 启动时调用一次（由 SceneDelegate 触发）。libterracotta 未链接时为空操作。
+/// 首次打开陶瓦联机界面时调用。libterracotta 未链接时安全失败。
 - (void)initializeTerracotta;
 
 /// 房主：创建房间（手动端口模式）。
