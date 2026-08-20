@@ -77,13 +77,51 @@ void osm_make_current(osm_render_window_t* bundle) {
 void osm_swap_buffers() {
     osm_apply_current_ll();
     handle.glFinish(); // this will force osmesa to write the last rendered image into the buffer
-    osm_render_window_t bundle = currentBundle->osm;
+
+    // The render thread owns the OSMesa buffer. Do not hand that pointer to the
+    // main queue: a resize or context switch can realloc/free it before the
+    // queued block calls CGDataProviderCreateWithData.
+    const size_t frameWidth = windowWidth;
+    const size_t frameHeight = windowHeight;
+    if (frameWidth == 0 || frameHeight == 0 || !currentBundle->osm.buffer) {
+        return;
+    }
+
+    if (frameWidth > SIZE_MAX / frameHeight ||
+        frameWidth * frameHeight > SIZE_MAX / 4) {
+        return;
+    }
+
+    const size_t frameLength = frameWidth * frameHeight * 4;
+    NSData *frameData = [NSData dataWithBytes:currentBundle->osm.buffer length:frameLength];
+    CGColorSpaceRef colorSpace = currentBundle->osm.color_space
+        ? CGColorSpaceRetain(currentBundle->osm.color_space)
+        : CGColorSpaceCreateDeviceRGB();
+
     dispatch_async(dispatch_get_main_queue(), ^{
-    CGDataProviderRef bitmapProvider = CGDataProviderCreateWithData(NULL, bundle.buffer, windowWidth * windowHeight * 4, NULL);
-    CGImageRef bitmap = CGImageCreate(windowWidth, windowHeight, 8, 32, 4 * windowWidth, bundle.color_space, kCGImageAlphaNoneSkipLast | kCGBitmapByteOrderDefault, bitmapProvider, NULL, FALSE, kCGRenderingIntentDefault);
-    SurfaceViewController.surface.layer.contents = (__bridge id)bitmap;
-    CGImageRelease(bitmap);
-    CGDataProviderRelease(bitmapProvider);
+        if (!frameData || !colorSpace) {
+            if (colorSpace) CGColorSpaceRelease(colorSpace);
+            return;
+        }
+
+        CGDataProviderRef bitmapProvider = CGDataProviderCreateWithData(
+            NULL, frameData.bytes, frameLength, NULL);
+        if (!bitmapProvider) {
+            CGColorSpaceRelease(colorSpace);
+            return;
+        }
+
+        CGImageRef bitmap = CGImageCreate(
+            frameWidth, frameHeight, 8, 32, 4 * frameWidth, colorSpace,
+            kCGImageAlphaNoneSkipLast | kCGBitmapByteOrderDefault,
+            bitmapProvider, NULL, FALSE, kCGRenderingIntentDefault);
+        if (bitmap) {
+            SurfaceViewController.surface.layer.contents = (__bridge id)bitmap;
+            CGImageRelease(bitmap);
+        }
+
+        CGDataProviderRelease(bitmapProvider);
+        CGColorSpaceRelease(colorSpace);
     });
 }
 
