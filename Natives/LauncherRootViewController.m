@@ -16,7 +16,6 @@
 #import "ModpackImportViewController.h"
 #import "LauncherPrefGameDirViewController.h"
 #import "CustomControlsViewController.h"
-#import "TerracottaViewController.h"
 #import "AccountListViewController.h"
 
 // 布局常量（iPad 基准值；iPhone 上通过 LauncherRootLayoutWidth 适配后会变窄）
@@ -476,7 +475,19 @@ static CGFloat LauncherRootLayoutRightPanelWidth(UITraitCollection *trait) {
 }
 
 - (void)showMultiplayer {
-    TerracottaViewController *vc = [[TerracottaViewController alloc] init];
+    // Resolve the optional multiplayer page at runtime so ordinary launcher
+    // startup does not depend on loading the networking UI class.
+    Class terracottaClass = NSClassFromString(@"TerracottaViewController");
+    if (terracottaClass == Nil || ![terracottaClass isSubclassOfClass:[UIViewController class]]) {
+        UIAlertController *alert = [UIAlertController
+            alertControllerWithTitle:@"陶瓦联机不可用"
+                              message:@"当前构建未包含陶瓦联机页面。"
+                       preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
+        return;
+    }
+    UIViewController *vc = [[terracottaClass alloc] init];
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
     nav.navigationBar.prefersLargeTitles = NO;
     [self setContentViewController:nav animated:YES];
