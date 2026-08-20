@@ -450,6 +450,13 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
 
         // Setup AMETHYST_RENDERER
         NSString *renderer = [PLProfiles resolveKeyForCurrentProfile:@"renderer"];
+        // GL4ES 的硬件扩展探测在 iOS 上依赖旧式 GL 状态；在 Java 17+ / 1.21+
+        // 的 GLFW 创建上下文阶段可能直接调用空函数指针（GetHardwareExtensions）。
+        // 现代版本统一使用 ANGLE 作为兼容 OpenGL 后端，旧版 Java 保留用户选择。
+        if (minVersion >= 17 && [renderer isEqualToString:@ RENDERER_NAME_GL4ES]) {
+            NSLog(@"[JavaLauncher] GL4ES is unsafe on Java %d; falling back to ANGLE", minVersion);
+            renderer = @ RENDERER_NAME_MTL_ANGLE;
+        }
         NSLog(@"[JavaLauncher] RENDERER is set to %@\n", renderer);
         setenv("AMETHYST_RENDERER", renderer.UTF8String, 1);
 
