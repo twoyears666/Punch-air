@@ -104,8 +104,8 @@ void osm_swap_buffers() {
             return;
         }
 
-        CGDataProviderRef bitmapProvider = CGDataProviderCreateWithData(
-            NULL, frameData.bytes, frameLength, NULL);
+        CGDataProviderRef bitmapProvider = CGDataProviderCreateWithCFData(
+            (__bridge CFDataRef)frameData);
         if (!bitmapProvider) {
             CGColorSpaceRelease(colorSpace);
             return;

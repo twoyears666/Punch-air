@@ -88,25 +88,6 @@
         self.navigationItem.leftBarButtonItem = closeItem;
     }
 
-    /* ZeroTier 联机入口：始终使用浮动按钮放置在视图右上角
-       （导航栏可见时也保留，确保 modal/pushed 模式下可访问） */
-    UIButton *ztFab = [UIButton buttonWithType:UIButtonTypeSystem];
-    [ztFab setImage:[UIImage systemImageNamed:@"network"] forState:UIControlStateNormal];
-    ztFab.tintColor = [UIColor whiteColor];
-    ztFab.backgroundColor = [UIColor systemBlueColor];
-    ztFab.layer.cornerRadius = 18;
-    ztFab.layer.masksToBounds = YES;
-    ztFab.translatesAutoresizingMaskIntoConstraints = NO;
-    ztFab.accessibilityLabel = @"ZeroTier 联机";
-    [ztFab addTarget:self action:@selector(switchToZeroTier:) forControlEvents:UIControlEventTouchUpInside];
-    [self.view addSubview:ztFab];
-    [self.view bringSubviewToFront:ztFab];
-    [NSLayoutConstraint activateConstraints:@[
-        [ztFab.widthAnchor constraintEqualToConstant:36],
-        [ztFab.heightAnchor constraintEqualToConstant:36],
-        [ztFab.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:8],
-        [ztFab.trailingAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.trailingAnchor constant:-16],
-    ]];
 
     /* 适配自定义启动器背景：透明化 VC，让全局背景图/毛玻璃透出 */
     [[BackgroundManager sharedManager] makeViewControllerTransparent:self];
