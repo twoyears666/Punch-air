@@ -16,14 +16,7 @@
 #import "ModpackImportViewController.h"
 #import "LauncherPrefGameDirViewController.h"
 #import "CustomControlsViewController.h"
-// ZeroTier/Terracotta 联机暂时移除（排查启动崩溃）
-// #import "MultiplayerViewController.h"
-// #import "TerracottaViewController.h"
-// #import "TerracottaManager.h"
-// #import "TerracottaBridge.h"
 #import "AccountListViewController.h"
-#import "AI/AIViewController.h"
-#import "AI/AiSessionStore.h"
 
 // 布局常量（iPad 基准值；iPhone 上通过 LauncherRootLayoutWidth 适配后会变窄）
 static const CGFloat kSidebarWidthPad = 70.0;      // iPad 左侧边栏宽度
@@ -336,20 +329,10 @@ static CGFloat LauncherRootLayoutRightPanelWidth(UITraitCollection *trait) {
                                              selector:@selector(showSettings)
                                                  name:@"ShowSettings"
                                                object:nil];
-    // 监听显示 AI 助手页面
     [[NSNotificationCenter defaultCenter] addObserver:self
-                                             selector:@selector(showAIPage)
-                                                 name:@"ShowAIPage"
+                                             selector:@selector(showMultiplayer)
+                                                 name:@"ShowMultiplayer"
                                                object:nil];
-    // ZeroTier/Terracotta 联机暂时移除（排查启动崩溃）
-    // [[NSNotificationCenter defaultCenter] addObserver:self
-    //                                          selector:@selector(showMultiplayer)
-    //                                              name:@"ShowMultiplayer"
-    //                                            object:nil];
-    // [[NSNotificationCenter defaultCenter] addObserver:self
-    //                                          selector:@selector(showZeroTier)
-    //                                              name:@"ShowZeroTier"
-    //                                            object:nil];
     // 首页快捷瓷砖触发：切到对应内容区子页面（不再 FormSheet 弹窗）
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(showModsManager)
@@ -491,31 +474,23 @@ static CGFloat LauncherRootLayoutRightPanelWidth(UITraitCollection *trait) {
     [self setContentViewController:navVC animated:YES];
 }
 
-- (void)showAIPage {
-    // 从 AiSessionStore 取最近会话，没有则让 AIViewController 新建一个
-    AiSession *session = [[AiSessionStore sharedStore] lastActiveSession];
-    AIViewController *vc = [[AIViewController alloc] initWithSession:session];
-    UINavigationController *navVC = [[UINavigationController alloc] initWithRootViewController:vc];
-    navVC.navigationBar.prefersLargeTitles = NO;
-    [self setContentViewController:navVC animated:YES];
-}
-
-// ZeroTier/Terracotta 联机暂时移除（排查启动崩溃）
-// - (void)showMultiplayer { ... TerracottaViewController ... }
-// - (void)showZeroTier { ... MultiplayerViewController ... TerracottaManager ... }
 - (void)showMultiplayer {
-    [self showMultiplayerDisabledAlert];
-}
-- (void)showZeroTier {
-    [self showMultiplayerDisabledAlert];
-}
-- (void)showMultiplayerDisabledAlert {
-    UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:localize(@"i18n_str_320", nil)
-                          message:localize(@"i18n_str_321", nil)
-                   preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:localize(@"i18n_str_322", nil) style:UIAlertActionStyleDefault handler:nil]];
-    [self presentViewController:alert animated:YES completion:nil];
+    // Resolve the optional multiplayer page at runtime so ordinary launcher
+    // startup does not depend on loading the networking UI class.
+    Class terracottaClass = NSClassFromString(@"TerracottaViewController");
+    if (terracottaClass == Nil || ![terracottaClass isSubclassOfClass:[UIViewController class]]) {
+        UIAlertController *alert = [UIAlertController
+            alertControllerWithTitle:@"陶瓦联机不可用"
+                              message:@"当前构建未包含陶瓦联机页面。"
+                       preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
+        return;
+    }
+    UIViewController *vc = [[terracottaClass alloc] init];
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+    nav.navigationBar.prefersLargeTitles = NO;
+    [self setContentViewController:nav animated:YES];
 }
 
 #pragma mark - 首页快捷入口 (替换原 FormSheet 弹窗)
@@ -529,6 +504,7 @@ static CGFloat LauncherRootLayoutRightPanelWidth(UITraitCollection *trait) {
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vm];
     nav.navigationBar.prefersLargeTitles = NO;
     ModsManagerViewController *m = [[ModsManagerViewController alloc] init];
+    m.initialMode = ModsManagerModeLocal;
     [nav pushViewController:m animated:NO];
     [self setContentViewController:nav animated:YES];
 }

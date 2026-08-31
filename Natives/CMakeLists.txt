@@ -56,23 +56,21 @@ set(ZT_FRAMEWORK_LINK "")
 set(ZT_CXX_LIB "")
 
 # ============================================================================
-# libterracotta.xcframework 集成（陶瓦联机）—— 暂时移除（注释掉以排查启动崩溃）
+# libterracotta.xcframework 集成（陶瓦联机）
 # ============================================================================
-# set(TERRACOTTA_LIB_DIR "${CMAKE_CURRENT_LIST_DIR}/terracotta")
-# set(TERRACOTTA_XCFW "${TERRACOTTA_LIB_DIR}/libterracotta.xcframework")
-# set(TERRACOTTA_LIB "")
-# set(TERRACOTTA_AVAILABLE OFF)
-# if(EXISTS "${TERRACOTTA_XCFW}/ios-arm64/libterracotta.a")
-#   set(_TC_LIB_PATH "${TERRACOTTA_XCFW}/ios-arm64/libterracotta.a")
-#   set(TERRACOTTA_LIB "-Wl,-force_load,${_TC_LIB_PATH}")
-#   set(TERRACOTTA_AVAILABLE ON)
-# elseif(EXISTS "${TERRACOTTA_LIB_DIR}/libterracotta.a")
-#   set(_TC_LIB_PATH "${TERRACOTTA_LIB_DIR}/libterracotta.a")
-#   set(TERRACOTTA_LIB "-Wl,-force_load,${_TC_LIB_PATH}")
-#   set(TERRACOTTA_AVAILABLE ON)
-# endif()
+set(TERRACOTTA_LIB_DIR "${CMAKE_CURRENT_LIST_DIR}/terracotta")
+set(TERRACOTTA_XCFW "${TERRACOTTA_LIB_DIR}/libterracotta.xcframework")
 set(TERRACOTTA_LIB "")
 set(TERRACOTTA_AVAILABLE OFF)
+if(EXISTS "${TERRACOTTA_XCFW}/ios-arm64/libterracotta.a")
+  set(_TC_LIB_PATH "${TERRACOTTA_XCFW}/ios-arm64/libterracotta.a")
+  set(TERRACOTTA_LIB "-Wl,-force_load,${_TC_LIB_PATH}")
+  set(TERRACOTTA_AVAILABLE ON)
+elseif(EXISTS "${TERRACOTTA_LIB_DIR}/libterracotta.a")
+  set(_TC_LIB_PATH "${TERRACOTTA_LIB_DIR}/libterracotta.a")
+  set(TERRACOTTA_LIB "-Wl,-force_load,${_TC_LIB_PATH}")
+  set(TERRACOTTA_AVAILABLE ON)
+endif()
 
 # For cacio support library
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -rpath @loader_path -rpath @executable_path/java_runtimes/java-8-openjdk/lib -rpath /usr/lib/jvm/java-8-openjdk/lib")
@@ -303,7 +301,6 @@ add_executable(AngelAuraAmethyst
   installer/ForgeInstallSchemeViewController.m
   installer/ForgeDirectInstaller.m
   installer/NeoForgeDirectInstaller.m
-  installer/ForgeProcessorExecutor.m
   installer/ModpackInstallViewController.m
   installer/ModLoaderInstallViewController.m
   installer/FabricUtils.m
@@ -325,16 +322,12 @@ add_executable(AngelAuraAmethyst
   InlineMessageView.m
   DownloadTaskItem.m
   DownloadTaskManager.m
-  PLTaskStage.m
-  PLTaskProgressViewController.m
   DownloadTasksViewController.m
-  DownloadHistoryViewController.m
-  DownloadHistoryStore.m
-  PLDownloadClient.m
-  PLMirrorCenter.m
   AppDelegate.m
   CustomControlsViewController.m
   CustomControlsViewController+UndoManager.m
+  DownloadProgressViewController.m
+  DownloadProgressCardView.m
   FileListViewController.m
   GameSurfaceView.m
   JavaGUIViewController.m
@@ -361,6 +354,7 @@ add_executable(AngelAuraAmethyst
   LauncherPrefGameDirViewController.m
   LauncherPrefManageJREViewController.m
   LauncherProfileEditorViewController.m
+  LauncherProfilesViewController.m
   LauncherSplitViewController.m
   MinecraftResourceDownloadTask.m
   MinecraftResourceUtils.m
@@ -384,12 +378,8 @@ add_executable(AngelAuraAmethyst
   ios_uikit_bridge.m
   utils.m
 
-  # Version card cell (used by DownloadViewController)
+  # Version card cell (shared between DownloadViewController and LauncherProfilesViewController)
   VersionCardCell.m
-
-  # Resource management shared base classes (card cell + list VC, shared by the 6 resource managers)
-  ResourceCardTableViewCell.m
-  ResourceListViewController.m
 
   # Mod-related sources (ensure implementations are compiled and linked)
   MarqueeLabel.m
@@ -411,9 +401,13 @@ add_executable(AngelAuraAmethyst
   # 统一的项目图标加载器（双层缓存+降采样+并发控制+CDN镜像，参照 FCL Glide + ZL2 Coil）
   IconLoader.m
 
+  # MCIM 模组镜像源工具类（参考 ZalithLauncher 2 MCIMMirror.kt）
+  MCIMMirror.m
+
   # Shader-related sources
   ShaderItem.m
   ShaderService.m
+  ShaderTableViewCell.m
   ShaderVersion.m
   ShaderVersionTableViewCell.m
   ShaderVersionViewController.m
@@ -427,8 +421,6 @@ add_executable(AngelAuraAmethyst
 
   # CurseForge MurmurHash2 fingerprint tool
   MurmurHash2.m
-  # CurseForge MurmurHash2 指纹便捷计算（mod 检测更新反查用，过滤空白字节后计算）
-  CurseForgeMurmurHash.m
 
   # Resource Pack / Data Pack / World management (services, items, version VC, manager VCs)
   ResourcePackItem.m
@@ -453,6 +445,7 @@ add_executable(AngelAuraAmethyst
 
   # Mod update service (dual-source SHA1/MurmurHash2 reverse lookup)
   ModUpdateService.m
+  ModUpdateViewController.m
 
   # Custom icon management sources
   CustomIconManager.m
@@ -471,11 +464,11 @@ add_executable(AngelAuraAmethyst
   TouchControllerBridge.m
   TouchControllerPreferencesViewController.m
 
-  # Terracotta multiplayer（陶瓦联机）—— 暂时移除（排查启动崩溃）
-  # TerracottaBridge.m
-  # TerracottaManager.m
-  # SilentAudioPlayer.m
-  # TerracottaViewController.m
+  # Terracotta multiplayer（陶瓦联机）
+  TerracottaBridge.m
+  TerracottaManager.m
+  SilentAudioPlayer.m
+  TerracottaViewController.m
 
   # Update checker（参考 FCL/ZL2，使用 GitHub Releases API 检查正式版更新）
   UpdateChecker.m
@@ -491,42 +484,6 @@ add_executable(AngelAuraAmethyst
   MarkdownParser.m
   AnnouncementListViewController.m
   AnnouncementDetailViewController.m
-
-  # Air AI Agent（OpenAI 兼容聊天助手）
-  AI/AiProvider.m
-  AI/AiProviderStore.m
-  AI/AiMessage.m
-  AI/AiSession.m
-  AI/AiSessionStore.m
-  AI/AiSettings.m
-  AI/AiAPIClient.m
-  AI/AiAgent.m
-  AI/AIMessageCell.m
-  AI/AIInputBarView.m
-  AI/AIViewController.m
-  AI/AISessionListViewController.m
-  AI/AIProviderConfigViewController.m
-  AI/AISystemPromptEditorViewController.m
-
-  # Air AI Agent 工具基础层（3a：注册表 / 安全机制 / 实例 / 日志 / 崩溃 / 文件 / 问答）
-  AI/AiToolRegistry.m
-  AI/AiSafetyManager.m
-  AI/AiToolBootstrapper.m
-  AI/AiInstancesTool.m
-  AI/AiLogReader.m
-  AI/AiCrashAnalyzer.m
-  AI/AiFileTools.m
-  AI/AiAskTool.m
-
-  # Air AI Agent 资源/网络工具（3b：Modrinth 搜索 + 资源安装/引导）
-  AI/AiAssetTools.m
-
-  # Air AI Agent 第二轮增强（enhance-ai-agent：设置 / to-do / sleep / 下载查询 / 实例创建）
-  AI/AiSettingsTools.m
-  AI/AiTodoTool.m
-  AI/AiSleepTool.m
-  AI/AiDownloadProbe.m
-  AI/AiInstanceCreator.m
 )
 
 # Add ModLoaderIcons PNG files into the app bundle Resources/ModLoaderIcons so they are available at runtime.
@@ -577,7 +534,8 @@ target_link_libraries(AngelAuraAmethyst
   "-framework WebKit"
   "-weak_framework SafariServices"
   ${TOUCHCONTROLLER_LIB}
-  # Terracotta multiplayer 暂时移除：${TERRACOTTA_LIB} "-lc++" "-lresolv"
+  # Terracotta multiplayer
+  ${TERRACOTTA_LIB} "-lc++" "-lresolv"
 )
 set_target_properties(AngelAuraAmethyst PROPERTIES
   MACOSX_BUNDLE TRUE

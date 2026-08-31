@@ -1,4 +1,3 @@
-#import "utils.h"
 #import "TerracottaBridge.h"
 #import "terracotta.h"
 #import <fcntl.h>
@@ -39,17 +38,29 @@ static void terracottaCallWithOptionalCString(NSString *s, void (^body)(const ch
         NSLog(@"[TerracottaBridge] libterracotta not linked, start ignored");
         return NO;
     }
-    int fd = -1;
-    if (loggingPath != nil) {
-        /* C 标准八进制：O_WRONLY=01, O_CREAT=0100, O_TRUNC=01000, O_APPEND=02000, mode=0644
-         * 注意：不能用 C++14 的 0o 前缀（C 语言不支持，AppleClang 会报 invalid suffix） */
-        fd = open([loggingPath UTF8String], 02000 | 0100 | 01000, 0644);
+    if (workingDirectory.length == 0) {
+        NSLog(@"[TerracottaBridge] working directory is empty");
+        return NO;
     }
-    @try {
-        return terracotta_ios_start([workingDirectory UTF8String], fd) == 0 ? YES : NO;
-    } @finally {
-        if (fd >= 0) close(fd);
-    }
+
+    /* Rust 核心明确要求每个进程只初始化一次。用 dispatch_once 在桥接层兜底，
+     * 即使未来出现第二个调用入口，也不会重复执行 terracotta_ios_start。 */
+    static dispatch_once_t onceToken;
+    static BOOL startResult = NO;
+    dispatch_once(&onceToken, ^{
+        int fd = -1;
+        if (loggingPath != nil) {
+            /* C 标准八进制：O_WRONLY=01, O_CREAT=0100, O_TRUNC=01000, O_APPEND=02000, mode=0644
+             * 注意：不能用 C++14 的 0o 前缀（C 语言不支持，AppleClang 会报 invalid suffix） */
+            fd = open([loggingPath UTF8String], 02000 | 0100 | 01000, 0644);
+        }
+        @try {
+            startResult = terracotta_ios_start([workingDirectory UTF8String], fd) == 0 ? YES : NO;
+        } @finally {
+            if (fd >= 0) close(fd);
+        }
+    });
+    return startResult;
 }
 
 + (void)setWaiting {
@@ -222,13 +233,13 @@ static void terracottaCallWithOptionalCString(NSString *s, void (^body)(const ch
 
 + (NSString *)describeException:(NSInteger)type {
     switch (type) {
-        case 0: return localize(@"i18n_str_989", nil);
-        case 1: return localize(@"i18n_str_990", nil);
-        case 2: return localize(@"i18n_str_991", nil);
-        case 3: return localize(@"i18n_str_992", nil);
-        case 4: return localize(@"i18n_str_993", nil);
-        case 5: return localize(@"i18n_str_994", nil);
-        default: return [NSString stringWithFormat:localize(@"i18n_str_995", nil), (long)type];
+        case 0: return @"无法连接到房主（PingHostFail）";
+        case 1: return @"房主拒绝连接（PingHostRst）";
+        case 2: return @"访客端 EasyTier 崩溃（GuestEasytierCrash）";
+        case 3: return @"房主端 EasyTier 崩溃（HostEasytierCrash）";
+        case 4: return @"MC 服务器拒绝连接（PingServerRst）";
+        case 5: return @"Scaffolding 协议返回非法数据";
+        default: return [NSString stringWithFormat:@"未知错误（type=%ld）", (long)type];
     }
 }
 

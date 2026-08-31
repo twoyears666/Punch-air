@@ -5,9 +5,7 @@
 #import "LauncherCardLayoutViewController.h"
 #import "LauncherPreferences.h"
 #import "BackgroundManager.h"
-// Terracotta 暂时移除（排查启动崩溃）
-// #import "TerracottaManager.h"
-// #import "TerracottaBridge.h"
+// Terracotta initializes lazily when the multiplayer page opens.
 
 extern UIWindow *mainWindow;
 
@@ -19,14 +17,8 @@ extern UIWindow *mainWindow;
 - (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session options:(UISceneConnectionOptions *)connectionOptions {
     UIWindowScene *windowScene = (UIWindowScene *)scene;
     
-    // 强制横屏 (iOS 16+)
-    if (@available(iOS 16.0, *)) {
-        UIWindowSceneGeometryPreferencesIOS *geometryPreferences = [[UIWindowSceneGeometryPreferencesIOS alloc] init];
-        geometryPreferences.interfaceOrientations = UIInterfaceOrientationMaskLandscape;
-        [windowScene requestGeometryUpdateWithPreferences:geometryPreferences errorHandler:^(NSError *error) {
-            NSLog(@"[SceneDelegate] Failed to update geometry: %@", error);
-        }];
-    }
+    // Keep the system-provided scene geometry so iPad Stage Manager can resize
+    // the window freely. Orientation support is declared below.
     
     self.window = [[UIWindow alloc] initWithWindowScene:windowScene];
     self.window.frame = windowScene.coordinateSpace.bounds;
@@ -74,56 +66,15 @@ extern UIWindow *mainWindow;
     // 中已 loadSavedBackground/loadUISettings，单例首次访问即完成初始化，无需延迟。
     [[BackgroundManager sharedManager] applyBackgroundToWindow:self.window];
 
-    [self showTranslationNoticeIfNeeded];
-
-    // Terracotta 暂时移除（排查启动崩溃）
-    // if ([TerracottaBridge isAvailable]) {
-    //     TerracottaManager *mgr = [TerracottaManager shared];
-    //     NSLog(@"[SceneDelegate] Terracotta manager initialized: %d", mgr.initialized);
-    // } else {
-    //     NSLog(@"[SceneDelegate] libterracotta not linked, multiplayer disabled");
-    // }
-    NSLog(@"[SceneDelegate] Terracotta temporarily disabled for crash investigation");
+    // Terracotta is initialized lazily by the multiplayer view. This keeps
+    // ordinary game launches independent from the networking core.
+    NSLog(@"[SceneDelegate] Terracotta initialization deferred until multiplayer is opened");
 
     // 监听主题切换通知（设置页"外观模式"切换时实时应用，无需重启）
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(applyUITheme:)
                                                  name:@"UIThemeChanged"
                                                object:nil];
-}
-
-- (void)showTranslationNoticeIfNeeded {
-    // 仅当系统语言为英文时提示：部分内容为机翻，可能不够准确，欢迎提交翻译 PR。
-    // 用户选择"不再提醒"后通过偏好持久化，下次不再弹出。
-    if (![NSLocale.preferredLanguages.firstObject hasPrefix:@"en"]) {
-        return;
-    }
-    if (getPrefBool(@"general.translation_notice_dismissed")) {
-        return;
-    }
-
-    UIViewController *presenter = self.window.rootViewController;
-    if (presenter == nil) {
-        return;
-    }
-
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:localize(@"i18n_str_2000", nil)
-                                                                   message:localize(@"i18n_str_2001", nil)
-                                                            preferredStyle:UIAlertControllerStyleAlert];
-
-    UIAlertAction *gotItAction = [UIAlertAction actionWithTitle:localize(@"i18n_str_2002", nil)
-                                                          style:UIAlertActionStyleDefault
-                                                        handler:nil];
-    [alert addAction:gotItAction];
-
-    UIAlertAction *dontAskAction = [UIAlertAction actionWithTitle:localize(@"i18n_str_2003", nil)
-                                                            style:UIAlertActionStyleCancel
-                                                          handler:^(UIAlertAction *action) {
-        setPrefBool(@"general.translation_notice_dismissed", YES);
-    }];
-    [alert addAction:dontAskAction];
-
-    [presenter presentViewController:alert animated:YES completion:nil];
 }
 
 - (void)applyUITheme:(NSNotification *)notification {
@@ -161,6 +112,9 @@ extern UIWindow *mainWindow;
 #pragma mark - Orientation Support (iOS 16+)
 
 - (UIInterfaceOrientationMask)scene:(UIScene *)scene supportedInterfaceOrientationsForWindowScene:(UIWindowScene *)windowScene API_AVAILABLE(ios(16.0)) {
+    if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad) {
+        return UIInterfaceOrientationMaskAll;
+    }
     return UIInterfaceOrientationMaskLandscape;
 }
 

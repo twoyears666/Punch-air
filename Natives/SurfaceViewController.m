@@ -297,6 +297,17 @@ static GameSurfaceView* pojavWindow;
 @property(nonatomic, assign) BOOL launchOverlayDismissed;
 @property(nonatomic, strong) UIButton *launchCancelButton;     // 取消启动按钮
 
+// 台前调度/Stage Manager 在短时间内可能连续触发布局过渡。
+// 将窗口尺寸提交合并到过渡完成后，避免渲染线程与 UIKit 同时改动窗口状态。
+@property(nonatomic, assign) BOOL resolutionUpdateScheduled;
+@property(nonatomic, assign) BOOL isTransitioningWindowSize;
+@property(nonatomic, assign) NSUInteger windowTransitionGeneration;
+@property(nonatomic, assign) BOOL hasSubmittedWindowSize;
+@property(nonatomic, assign) int lastSubmittedWindowWidth;
+@property(nonatomic, assign) int lastSubmittedWindowHeight;
+@property(nonatomic, assign) CGSize lastSurfaceLayoutSize;
+@property(nonatomic, assign) CGSize pendingRendererLayoutSize;
+
 @end
 
 @implementation SurfaceViewController
@@ -1199,10 +1210,67 @@ static GameSurfaceView* pojavWindow;
 
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
-    // 更新启动遮罩层渐变背景的 frame（旋转/尺寸变化时）
+
     if (self.launchGradientLayer && self.launchOverlayView) {
         self.launchGradientLayer.frame = self.launchOverlayView.bounds;
     }
+
+    CGSize size = self.view.bounds.size;
+    if (!self.surfaceView || !self.touchView || !self.rootView ||
+        size.width <= 0.0 || size.height <= 0.0 ||
+        CGSizeEqualToSize(size, self.lastSurfaceLayoutSize)) {
+        return;
+    }
+
+    self.lastSurfaceLayoutSize = size;
+    CGRect visibleBounds = CGRectMake(0.0, 0.0, size.width, size.height);
+
+    // Stage Manager gives self.view a window-space frame. Use zero-origin
+    // bounds for every child so the game and controls do not drift.
+    self.rootView.frame = CGRectMake(0.0, 0.0, size.width + 30.0, size.height);
+    self.rootView.bounds = CGRectMake(0.0, 0.0, size.width + 30.0, size.height);
+    self.touchView.frame = visibleBounds;
+    self.surfaceView.frame = self.touchView.bounds;
+    self.inputTextField.frame = CGRectMake(0.0, -32.0, size.width, 30.0);
+    self.ctrlView.frame = getSafeArea(self.view.bounds);
+    [self.ctrlView.subviews makeObjectsPerformSelector:@selector(update)];
+    [self viewWillTransitionToSize_Navigation:visibleBounds];
+
+    if (self.gameMenuOverlay) {
+        self.gameMenuOverlay.frame = self.view.bounds;
+        [self.gameMenuOverlay setNeedsLayout];
+    }
+
+    self.pendingRendererLayoutSize = size;
+    [NSObject cancelPreviousPerformRequestsWithTarget:self
+                                             selector:@selector(commitPendingRendererSize)
+                                               object:nil];
+    [self performSelector:@selector(commitPendingRendererSize)
+               withObject:nil
+               afterDelay:0.20
+                  inModes:@[NSRunLoopCommonModes]];
+}
+
+- (void)commitPendingRendererSize {
+    if (self.isTransitioningWindowSize) {
+        [self performSelector:@selector(commitPendingRendererSize)
+                   withObject:nil
+                   afterDelay:0.20
+                      inModes:@[NSRunLoopCommonModes]];
+        return;
+    }
+
+    CGSize currentSize = self.view.bounds.size;
+    if (currentSize.width <= 0.0 || currentSize.height <= 0.0) return;
+    if (!CGSizeEqualToSize(currentSize, self.pendingRendererLayoutSize)) {
+        self.pendingRendererLayoutSize = currentSize;
+        [self performSelector:@selector(commitPendingRendererSize)
+                   withObject:nil
+                   afterDelay:0.20
+                      inModes:@[NSRunLoopCommonModes]];
+        return;
+    }
+    [self updateSavedResolution];
 }
 
 - (void)updateAudioSettings {
@@ -1293,6 +1361,24 @@ static GameSurfaceView* pojavWindow;
 }
 
 - (void)updateSavedResolution {
+    if (![NSThread isMainThread]) {
+        if (!self.resolutionUpdateScheduled) {
+            self.resolutionUpdateScheduled = YES;
+            __weak typeof(self) weakSelf = self;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                __strong typeof(weakSelf) strongSelf = weakSelf;
+                strongSelf.resolutionUpdateScheduled = NO;
+                [strongSelf updateSavedResolution];
+            });
+        }
+        return;
+    }
+
+    // 不要在 UIKit 的尺寸过渡动画中改动渲染窗口；完成回调会统一提交一次。
+    if (self.isTransitioningWindowSize) {
+        return;
+    }
+
     for (UIWindowScene *scene in UIApplication.sharedApplication.connectedScenes.allObjects) {
         self.screenScale = scene.screen.scale;
         if (scene.session.role != UIWindowSceneSessionRoleApplication) {
@@ -1301,7 +1387,10 @@ static GameSurfaceView* pojavWindow;
     }
 
     if (self.surfaceView.superview != nil) {
-        self.surfaceView.frame = self.surfaceView.superview.frame;
+        CGRect surfaceBounds = self.surfaceView.superview.bounds;
+        if (!CGRectEqualToRect(self.surfaceView.frame, surfaceBounds)) {
+            self.surfaceView.frame = surfaceBounds;
+        }
     }
 
     resolutionScale = getPrefFloat(@"video.resolution") / 100.0;
@@ -1346,7 +1435,17 @@ static GameSurfaceView* pojavWindow;
                   metalLayer.contentsScale);
         }
     }
-    CallbackBridge_nativeSendScreenSize(windowWidth, windowHeight);
+    // 26.2 在台前调度调整窗口时可能重复回调同一尺寸。
+    // GLFW 侧不需要重复 set size，重复提交会与 UIKit/CoreGraphics 的布局事务竞争。
+    BOOL sizeChanged = !self.hasSubmittedWindowSize ||
+        self.lastSubmittedWindowWidth != windowWidth ||
+        self.lastSubmittedWindowHeight != windowHeight;
+    if (sizeChanged) {
+        self.hasSubmittedWindowSize = YES;
+        self.lastSubmittedWindowWidth = windowWidth;
+        self.lastSubmittedWindowHeight = windowHeight;
+        CallbackBridge_nativeSendScreenSize(windowWidth, windowHeight);
+    }
 }
 
 - (void)updateControlHiddenState:(BOOL)hide {
@@ -1729,21 +1828,33 @@ static GameSurfaceView* pojavWindow;
 
 - (void)viewWillTransitionToSize:(CGSize)size withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator
 {
+    NSUInteger transitionGeneration = ++self.windowTransitionGeneration;
+    self.isTransitioningWindowSize = YES;
     [coordinator animateAlongsideTransition:^(id<UIViewControllerTransitionCoordinatorContext>  _Nonnull context) {
         self.rootView.bounds = CGRectMake(0, 0, size.width + 30.0, size.height);
 
-        CGRect frame = self.view.frame;
-        frame.size = size;
+        CGRect frame = CGRectMake(0.0, 0.0, size.width, size.height);
+        self.rootView.frame = CGRectMake(0.0, 0.0, size.width + 30.0, size.height);
+        self.rootView.bounds = CGRectMake(0.0, 0.0, size.width + 30.0, size.height);
         self.touchView.frame = frame;
+        self.surfaceView.frame = self.touchView.bounds;
         self.inputTextField.frame = CGRectMake(0, -32.0, size.width, 30.0);
         [self viewWillTransitionToSize_LogView:frame];
         [self viewWillTransitionToSize_Navigation:frame];
-        self.ctrlView.frame = getSafeArea(self.view.frame);
+        self.ctrlView.frame = getSafeArea(self.view.bounds);
         [self.ctrlView.subviews makeObjectsPerformSelector:@selector(update)];
-        [self updateSavedResolution];
         [GyroInput updateOrientation];
     } completion:^(id<UIViewControllerTransitionCoordinatorContext>  _Nonnull context) {
         virtualMouseFrame = self.mousePointerView.frame;
+        if (transitionGeneration != self.windowTransitionGeneration) {
+            return;
+        }
+        self.isTransitioningWindowSize = NO;
+        // 等 UIKit 完成最终布局后再提交一次渲染尺寸，避免 26.2 的重复布局竞态。
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self.view layoutIfNeeded];
+            [self updateSavedResolution];
+        });
     }];
     [super viewWillTransitionToSize:size withTransitionCoordinator:coordinator];
 }
