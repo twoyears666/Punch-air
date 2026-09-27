@@ -14,7 +14,6 @@
 #import "ModsManagerViewController.h"
 #import "ShadersManagerViewController.h"
 #import "ModpackImportViewController.h"
-#import "LauncherPrefGameDirViewController.h"
 #import "CustomControlsViewController.h"
 #import "AccountListViewController.h"
 
@@ -432,7 +431,7 @@ static CGFloat LauncherRootLayoutRightPanelWidth(UITraitCollection *trait) {
 }
 
 - (void)showVersionManager {
-    // 在中间内容区显示版本管理页面，包在 NavigationController 中以便子流程（模组/光影/游戏目录管理）push
+    // 在中间内容区显示版本管理页面，包在 NavigationController 中以便子流程（模组/光影管理等）push
     VersionManagerViewController *vc = [[VersionManagerViewController alloc] init];
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
     nav.navigationBar.prefersLargeTitles = NO;
@@ -519,12 +518,8 @@ static CGFloat LauncherRootLayoutRightPanelWidth(UITraitCollection *trait) {
 }
 
 - (void)showGameDirectory {
-    VersionManagerViewController *vm = [[VersionManagerViewController alloc] init];
-    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vm];
-    nav.navigationBar.prefersLargeTitles = NO;
-    LauncherPrefGameDirViewController *g = [[LauncherPrefGameDirViewController alloc] init];
-    [nav pushViewController:g animated:NO];
-    [self setContentViewController:nav animated:YES];
+    // 游戏目录选择已随多实例一并移除，等价于打开版本管理页
+    [self showVersionManager];
 }
 
 - (void)showModpackImport {

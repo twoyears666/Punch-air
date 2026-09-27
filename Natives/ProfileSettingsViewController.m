@@ -355,8 +355,7 @@ static NSString * localizeProfileTitle(NSString *title) {
     // ===== 副标题（游戏目录，12pt regular，secondaryLabelColor）=====
     UILabel *subtitleLabel = [[UILabel alloc] init];
     NSString *gameDir = [PLProfiles effectiveGameDirForProfile:self.profile];
-    NSString *instanceName = getPrefObject(@"general.game_directory") ?: @"default";
-    subtitleLabel.text = [NSString stringWithFormat:@"%@ → /instances/%@", gameDir, instanceName];
+    subtitleLabel.text = [NSString stringWithFormat:@"%@ → /instances", gameDir];
     subtitleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
     subtitleLabel.textColor = [UIColor secondaryLabelColor];
     subtitleLabel.adjustsFontSizeToFitWidth = YES;
@@ -448,8 +447,7 @@ static NSString * localizeProfileTitle(NSString *title) {
                 label.text = currentVersion.length > 0 ? currentVersion : localize(@"i18n_str_864", nil);
             } else {
                 NSString *gameDir = [PLProfiles effectiveGameDirForProfile:self.profile];
-                NSString *instanceName = getPrefObject(@"general.game_directory") ?: @"default";
-                label.text = [NSString stringWithFormat:@"%@ → /instances/%@", gameDir, instanceName];
+                label.text = [NSString stringWithFormat:@"%@ → /instances", gameDir];
             }
         }
     }
@@ -1263,7 +1261,7 @@ static NSString * localizeProfileTitle(NSString *title) {
 /// 自定义完全隔离目录（留空或 "." 视为自动 versions/<版本>）
 - (void)promptCustomIsolationDir {
     NSString *currentGameDir = self.profile[@"gameDir"] ?: @".";
-    NSString *currentInstance = getPrefObject(@"general.game_directory") ?: @"default";
+    NSString *gameRootDisplay = @"instances";
 
     UIAlertController *alert = [UIAlertController
         alertControllerWithTitle:localize(@"preference.isolation.custom", nil)
@@ -1272,12 +1270,12 @@ static NSString * localizeProfileTitle(NSString *title) {
                                       stringByAppendingString:localize(@"i18n_str_2010", nil)]
                                      stringByAppendingString:localize(@"i18n_str_2011", nil)]
                                     stringByAppendingString:localize(@"i18n_str_2012", nil)],
-                                  currentInstance]
+                                  gameRootDisplay]
                   preferredStyle:UIAlertControllerStyleAlert];
 
     [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
         textField.text = currentGameDir;
-        textField.placeholder = [NSString stringWithFormat:@". -> /Documents/instances/%@", currentInstance];
+        textField.placeholder = @". -> /instances";
         textField.autocorrectionType = UITextAutocorrectionTypeNo;
         textField.autocapitalizationType = UITextAutocapitalizationTypeNone;
         textField.clearButtonMode = UITextFieldViewModeWhileEditing;

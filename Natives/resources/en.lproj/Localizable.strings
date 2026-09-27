@@ -1908,7 +1908,7 @@
 "i18n_str_2006" = "  • Create a standalone version: %@-OptiFine_xxx\n";
 "i18n_str_2007" = "  • Loaded via launchwrapper + optifine.OptiFineTweaker\n";
 "i18n_str_2008" = "  • Switches to the new version automatically after installation\n\n";
-"i18n_str_2010" = "\".\" = use the instance directory selected by the game-directory switcher (%@)\n";
+"i18n_str_2010" = "\".\" = use the game directory (%@)\n";
 "i18n_str_2011" = "Relative path = a subdirectory relative to the current game directory (for version isolation)\n";
 "i18n_str_2012" = "Absolute path = use the specified path";
 

@@ -32,7 +32,7 @@ typedef NS_ENUM(NSInteger, AiSafetyMode) {
 /// AI 工具协议：每个内置工具实现该协议
 @protocol AiTool <NSObject>
 
-/// 工具名，如 list_instances
+/// 工具名，如 list_game_versions
 @property (nonatomic, readonly) NSString *name;
 /// 给 LLM 的描述（用途 + 参数说明 + 边界 + 示例）
 @property (nonatomic, readonly) NSString *summary;

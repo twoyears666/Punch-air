@@ -1,28 +1,14 @@
 //
-//  AiInstancesTool.m
+//  AiGameVersionsTool.m
 //  Amethyst
 //
 
-#import "AiInstancesTool.h"
-#import "PLProfiles.h"
-#import "LauncherPreferences.h"
+#import "AiGameVersionsTool.h"
 
-@interface AiInstancesTool ()
-@property (nonatomic, copy) NSString *internalName;
-@end
-
-@implementation AiInstancesTool
-
-- (instancetype)initWithName:(NSString *)name {
-    self = [super init];
-    if (self) {
-        _internalName = name ?: @"";
-    }
-    return self;
-}
+@implementation AiGameVersionsTool
 
 - (NSString *)name {
-    return self.internalName;
+    return @"list_game_versions";
 }
 
 - (AiToolPermission)permission {
@@ -30,65 +16,12 @@
 }
 
 - (NSString *)summary {
-    if ([self.internalName isEqualToString:@"list_game_versions"]) {
-        return @"拉取 Minecraft Java 版的真实版本列表（默认只返回正式版 release，避免快照等版本过多占用上下文）。"
-               "\n参数：includeSnapshots（boolean，可选，默认 false；为 true 时额外附加最新一条快照版本）。"
-               "\n说明：默认从 BMCLAPI 镜像获取版本清单，失败自动切换官方源重试；返回每个版本的 id（版本号）与 type（release/snapshot）。"
-               "\n内部有 30 分钟缓存（保存在 Documents/AI/game_versions.json，缓存完整清单）。"
-               "\n边界：若网络失败会返回错误信息，不会编造版本号。"
-               "\n示例：调用后得到 [{'id':'1.21.1','type':'release'}, ...]";
-    }
-    // list_instances
-    return @"列出启动器中已创建的游戏实例（即游戏目录下的版本/目录）。"
-           "\n无参数。"
-           "\n说明：每个实例项包含 profile 名称 name、gameDir、lastVersionId、当前是否选中 selected、"
-           "实例完整路径 path，以及已安装的 mods/resourcepacks/shaders/datapacks 数量（counts 子对象）。"
-           "\n数据来源为 POJAV_HOME/instances/ 目录与 launcher_profiles.json 的 profiles。"
-           "\n边界：实例目录不存在时回退返回当前实例信息。";
-}
-
-#pragma mark - 路径与常量
-
-+ (NSString *)pojavHome {
-    const char *home = getenv("POJAV_HOME");
-    if (home && strlen(home) > 0) return @(home);
-    return [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-}
-
-+ (NSString *)instancesDirectory {
-    return [[self pojavHome] stringByAppendingPathComponent:@"instances"];
-}
-
-+ (NSString *)currentInstanceName {
-    NSString *name = getPrefObject(@"general.game_directory");
-    return (name.length > 0) ? name : @"default";
-}
-
-+ (NSString *)currentGameRoot {
-    const char *root = getenv("POJAV_GAME_DIR");
-    if (root && strlen(root) > 0) return @(root);
-    return [[self instancesDirectory] stringByAppendingPathComponent:[self currentInstanceName]];
-}
-
-#pragma mark - 资源计数
-
-- (NSUInteger)countOfDirectory:(NSString *)dir {
-    NSArray *items = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
-    NSUInteger count = 0;
-    for (NSString *item in items) {
-        if ([item hasPrefix:@"."]) continue;
-        count++;
-    }
-    return count;
-}
-
-- (NSDictionary *)resourceCountsForDirectory:(NSString *)gameRoot {
-    return @{
-        @"mods": @([self countOfDirectory:[gameRoot stringByAppendingPathComponent:@"mods"]]),
-        @"resourcepacks": @([self countOfDirectory:[gameRoot stringByAppendingPathComponent:@"resourcepacks"]]),
-        @"shaders": @([self countOfDirectory:[gameRoot stringByAppendingPathComponent:@"shaderpacks"]]),
-        @"datapacks": @([self countOfDirectory:[gameRoot stringByAppendingPathComponent:@"datapacks"]]),
-    };
+    return @"拉取 Minecraft Java 版的真实版本列表（默认只返回正式版 release，避免快照等版本过多占用上下文）。"
+           "\n参数：includeSnapshots（boolean，可选，默认 false；为 true 时额外附加最新一条快照版本）。"
+           "\n说明：默认从 BMCLAPI 镜像获取版本清单，失败自动切换官方源重试；返回每个版本的 id（版本号）与 type（release/snapshot）。"
+           "\n内部有 30 分钟缓存（保存在 Documents/AI/game_versions.json，缓存完整清单）。"
+           "\n边界：若网络失败会返回错误信息，不会编造版本号。"
+           "\n示例：调用后得到 [{'id':'1.21.1','type':'release'}, ...]";
 }
 
 - (NSString *)jsonStringFromObject:(id)object {
@@ -104,83 +37,15 @@
      completion:(void (^)(NSString * _Nullable result, NSError * _Nullable error))completion {
     if (!completion) return;
 
-    if ([self.internalName isEqualToString:@"list_game_versions"]) {
-        BOOL includeSnapshots = NO;
-        id v = params[@"includeSnapshots"];
-        if ([v isKindOfClass:[NSString class]]) {
-            NSString *s = [(NSString *)v lowercaseString];
-            includeSnapshots = [s hasPrefix:@"t"] || [s isEqualToString:@"1"];
-        } else if (v != nil && ![v isKindOfClass:[NSNull class]]) {
-            includeSnapshots = [v boolValue];
-        }
-        [self performListGameVersionsIncludeSnapshots:includeSnapshots completion:completion];
-        return;
+    BOOL includeSnapshots = NO;
+    id v = params[@"includeSnapshots"];
+    if ([v isKindOfClass:[NSString class]]) {
+        NSString *s = [(NSString *)v lowercaseString];
+        includeSnapshots = [s hasPrefix:@"t"] || [s isEqualToString:@"1"];
+    } else if (v != nil && ![v isKindOfClass:[NSNull class]]) {
+        includeSnapshots = [v boolValue];
     }
-    if ([self.internalName isEqualToString:@"list_instances"]) {
-        [self performListInstances:completion];
-        return;
-    }
-
-    NSError *err = [NSError errorWithDomain:@"AiTool" code:404
-                                   userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"未知工具 %@", self.internalName]}];
-    completion(nil, err);
-}
-
-#pragma mark - list_instances
-
-- (void)performListInstances:(void (^)(NSString * _Nullable result, NSError * _Nullable error))completion {
-    NSString *instancesDir = [[self class] instancesDirectory];
-    NSString *currentInstanceName = [[self class] currentInstanceName];
-    PLProfiles *profiles = [PLProfiles current];
-    NSDictionary *profileDict = [profiles profiles];
-
-    NSMutableArray *entries = [NSMutableArray array];
-
-    // 列举 instances/ 下的子目录（每个实例 = 一个游戏目录）
-    NSArray *subdirs = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:instancesDir error:nil];
-    for (NSString *dirname in subdirs) {
-        NSString *fullPath = [instancesDir stringByAppendingPathComponent:dirname];
-        BOOL isDir = NO;
-        if ([[NSFileManager defaultManager] fileExistsAtPath:fullPath isDirectory:&isDir] == NO || !isDir) {
-            continue;
-        }
-        if ([dirname hasPrefix:@"."]) continue;
-
-        // 从 launcher_profiles.json 匹配 profile（按 name 匹配目录名）
-        NSDictionary *profile = [profileDict isKindOfClass:[NSDictionary class]] ? profileDict[dirname] : nil;
-        NSString *profileName = dirname;
-        NSString *lastVersionId = @"";
-        NSString *gameDir = @".";
-        if ([profile isKindOfClass:[NSDictionary class]]) {
-            if ([profile[@"name"] isKindOfClass:[NSString class]] && [profile[@"name"] length] > 0) profileName = profile[@"name"];
-            if ([profile[@"lastVersionId"] isKindOfClass:[NSString class]]) lastVersionId = profile[@"lastVersionId"];
-            if ([profile[@"gameDir"] isKindOfClass:[NSString class]] && [profile[@"gameDir"] length] > 0) gameDir = profile[@"gameDir"];
-        }
-
-        [entries addObject:@{
-            @"name": profileName ?: dirname,
-            @"gameDir": [fullPath stringByAppendingPathComponent:gameDir],
-            @"lastVersionId": lastVersionId ?: @"",
-            @"selected": @([dirname isEqualToString:currentInstanceName]),
-            @"path": fullPath,
-            @"counts": [self resourceCountsForDirectory:fullPath],
-        }];
-    }
-
-    // 取不到实例目录时，回退返回当前实例信息
-    if (entries.count == 0) {
-        NSString *currentRoot = [[self class] currentGameRoot];
-        [entries addObject:@{
-            @"name": [profiles selectedProfileName] ?: currentInstanceName,
-            @"gameDir": currentRoot,
-            @"lastVersionId": [PLProfiles resolveKeyForCurrentProfile:@"lastVersionId"] ?: @"",
-            @"selected": @YES,
-            @"path": currentRoot,
-            @"counts": [self resourceCountsForDirectory:currentRoot],
-        }];
-    }
-
-    completion([self jsonStringFromObject:entries], nil);
+    [self performListGameVersionsIncludeSnapshots:includeSnapshots completion:completion];
 }
 
 #pragma mark - list_game_versions
@@ -206,10 +71,6 @@
         @"https://bmclapi2.bangbang93.com/mc/game/version_manifest_v2.json",
         @"https://piston-meta.mojang.com/mc/game/version_manifest_v2.json",
     ];
-}
-
-- (void)performListGameVersions:(void (^)(NSString * _Nullable result, NSError * _Nullable error))completion {
-    [self performListGameVersionsIncludeSnapshots:NO completion:completion];
 }
 
 - (void)performListGameVersionsIncludeSnapshots:(BOOL)includeSnapshots

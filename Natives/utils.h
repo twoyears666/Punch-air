@@ -168,7 +168,7 @@ void installZinkStrideFix();
 // 捕获新 image 对 Vulkan loader 函数的符号引用
 void rebindZinkStrideFixForNewImage();
 void init_hookUIKitConstructor();
-void init_setupMultiDir();
+void init_setupGameDir();
 
 BOOL PLPatchMachOPlatformForFile(const char *path);
 

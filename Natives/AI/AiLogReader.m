@@ -31,20 +31,20 @@
 - (NSString *)summary {
     if ([self.internalName isEqualToString:@"read_crash_report"]) {
         return @"读取最新一份崩溃报告（crash-report 目录中修改时间最新的 .txt 文件）。"
-               "\n参数：instance（string，可选，实例/游戏目录名，缺省当前选中实例）。"
+               "\n参数：无。"
                "\n说明：优先读取 logs/crash-reports/ 目录，其次回退到 crash-reports/ 目录，返回最新 .txt 的内容，截断为末尾 6000 字符。"
                "\n边界：目录或文件不存在时返回「未找到崩溃报告」。";
     }
     if ([self.internalName isEqualToString:@"read_logs"]) {
         return @"一次并行读取多份日志（排查问题首选工具）。"
                "\n参数：logs（array，可选，元素：latest.log=游戏日志 / latestlog.txt=启动器日志 / latestlog.old.txt=上次启动器日志 / crash-report=最新崩溃报告）、"
-               "all（boolean，可选，true 时读取全部上述日志）、instance（string，可选，实例名，缺省当前选中实例）。"
+               "all（boolean，可选，true 时读取全部上述日志）。"
                "\n重要：启动器日志 latestlog.txt 通常已包含游戏日志（stdout/stderr 重定向），排查时优先读取它。"
                "\n返回 JSON 数组：{key, path, size, lastModified, content（各自截断末尾 4000 字符）}；不存在的文件标注缺失。";
     }
     // read_latest_log
-    return @"读取实例的最近启动日志（logs/latest.log）。"
-           "\n参数：instance（string，可选，实例/游戏目录名，缺省当前选中实例）。"
+    return @"读取最近一次启动的游戏日志（logs/latest.log）。"
+           "\n参数：无。"
            "\n说明：返回日志末尾 4000 字符（过长时起始部分被截断并注明）。文件不存在时返回「未找到日志」。"
            "\n提示：启动器级日志（POJAV_HOME/latestlog.txt，含游戏日志）请改用 read_logs。"
            "\n边界：仅读取 .log 文件，绝不读取其它类型文件。";
@@ -59,34 +59,20 @@
     return [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
 }
 
-/// 当前实例根目录（POJAV_GAME_DIR 或其回退）
+/// 当前游戏目录（POJAV_GAME_DIR 或其回退；已无多实例，固定为 <POJAV_HOME>/instances）
 + (NSString *)currentGameRoot {
     const char *root = getenv("POJAV_GAME_DIR");
     if (root && strlen(root) > 0) return @(root);
     const char *home = getenv("POJAV_HOME");
     if (home && strlen(home) > 0) {
-        NSString *name = getPrefObject(@"general.game_directory");
-        if (name.length == 0) name = @"default";
-        return [NSString stringWithFormat:@"%s/instances/%@", home, name];
+        return [NSString stringWithFormat:@"%s/instances", home];
     }
     return [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
 }
 
-/// 解析 instance 参数 → 实例根目录（<POJAV_HOME>/instances/<instance>，缺省当前实例）
+/// 日志根目录（只有一个游戏目录，不再支持按实例选择）
 + (NSString *)gameRootForParams:(NSDictionary *)params {
-    NSString *instance = [params[@"instance"] isKindOfClass:[NSString class]] ? params[@"instance"] : @"";
-    if (instance.length == 0) return [self currentGameRoot];
-    // 目录名安全化，防止 ../ 逃逸
-    NSArray *parts = [instance componentsSeparatedByCharactersInSet:
-                      [NSCharacterSet characterSetWithCharactersInString:@"/\\:"]];
-    NSString *safe = [parts componentsJoinedByString:@"_"];
-    NSString *root = [NSString stringWithFormat:@"%@/instances/%@", [self launcherHome], safe];
-    BOOL isDir = NO;
-    if ([[NSFileManager defaultManager] fileExistsAtPath:root isDirectory:&isDir] && isDir) {
-        return root;
-    }
-    // 回退：视为当前实例（不存在的目录返回原拼接路径，由读取侧报缺失）
-    return root;
+    return [self currentGameRoot];
 }
 
 /// 截断内容：保留末尾 N 字符，若被截断则在开头注明

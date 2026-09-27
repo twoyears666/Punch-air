@@ -74,15 +74,13 @@ static NSString * const kAiToolDomain = @"AiTool";
 
 #pragma mark - 沙盒路径安全
 
-/// 当前实例根目录（POJAV_GAME_DIR 或其回退）
+/// 当前游戏目录（POJAV_GAME_DIR 或其回退；已无多实例，固定为 <POJAV_HOME>/instances）
 + (NSString *)currentGameRoot {
     const char *root = getenv("POJAV_GAME_DIR");
     if (root && strlen(root) > 0) return @(root);
     const char *home = getenv("POJAV_HOME");
     if (home && strlen(home) > 0) {
-        NSString *name = getPrefObject(@"general.game_directory");
-        if (name.length == 0) name = @"default";
-        return [NSString stringWithFormat:@"%s/instances/%@", home, name];
+        return [NSString stringWithFormat:@"%s/instances", home];
     }
     return [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
 }
@@ -90,7 +88,7 @@ static NSString * const kAiToolDomain = @"AiTool";
 /// 文件工具合法根目录：启动器目录（POJAV_HOME；未设置时回退 Documents 下的启动器目录，
 /// 与 main.m 初始化逻辑一致——沙盒内即 Documents 本身，非沙盒为 Documents/AngelAuraAmethyst）。
 /// instances/*（mods/saves/resourcepacks 等）均位于其下；
-/// 经 realpath 归一化以匹配 POJAV_GAME_DIR 符号链接解析后的真实前缀，避免误判越界。
+/// 经 realpath 归一化以匹配 POJAV_GAME_DIR 的真实前缀，避免误判越界。
 /// enhance-ai-agent Task 16：从「整个 App 沙盒」收紧为启动器目录，杜绝读写容器外文件。
 + (NSString *)sandboxRoot {
     NSString *root = nil;

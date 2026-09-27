@@ -14,16 +14,15 @@
 #import "ModpackExportService.h" // for parseVersionId:
 #import <QuartzCore/QuartzCore.h>
 
-// Section 索引：2 个 section（游戏目录 / 已安装版本）
+// Section 索引：1 个 section（已安装版本）
 // 重新设计要点（参照 FCL 100%）：
-//   1. 版本管理界面只展示：游戏目录切换 + 已安装版本列表
+//   1. 版本管理界面只展示已安装版本列表（游戏目录选择已随多实例一并移除）
 //   2. 渲染器、图形 API、Mod/光影/资源包管理等全部移到"版本专属设置页"（ProfileSettingsViewController）
 //      点击版本卡片直接进入该版本的专属设置页，设置只对该版本生效（FCL 风格）
-//   3. 完全不调用旧 UI（LauncherPrefGameDirViewController / LauncherProfileEditorViewController）
-//   4. 游戏目录卡片支持长按弹出菜单（切换/删除当前目录）
+//   3. 完全不调用旧 UI（LauncherProfileEditorViewController）
+//   4. 版本卡片支持长按弹出菜单（选择/删除）
 //   5. 统一使用 accentColor() 与毛玻璃背景，适配启动器新 UI
-static NSInteger const kSectionGameDir     = 0;
-static NSInteger const kSectionVersions    = 1;
+static NSInteger const kSectionVersions    = 0;
 
 #pragma mark - Modern Tile Base Cell
 
@@ -320,151 +319,6 @@ static NSInteger const kSectionVersions    = 1;
 
 @end
 
-#pragma mark - Game Directory Cell (FCL 风格版本隔离卡片)
-
-@interface VMGameDirCell : VMTileBaseCell
-@property (nonatomic, strong) UIView *iconContainer;
-@property (nonatomic, strong) UIImageView *iconView;
-@property (nonatomic, strong) UILabel *nameLabel;
-@property (nonatomic, strong) UILabel *detailLabel;
-@property (nonatomic, strong) UIView *selectedBadge;
-@property (nonatomic, strong) UIImageView *chevronView;
-@end
-
-@implementation VMGameDirCell
-
-- (void)setupViews {
-    [super setupViews];
-
-    CGFloat iconBoxSize = [ScreenUtils dp:28];
-    CGFloat iconSize = [ScreenUtils dp:16];
-    CGFloat nameFont = [ScreenUtils sp:13];
-
-    // 规范 8.2：图标容器
-    self.iconContainer = [[UIView alloc] init];
-    self.iconContainer.translatesAutoresizingMaskIntoConstraints = NO;
-    self.iconContainer.layer.cornerRadius = 8;
-    self.iconContainer.layer.cornerCurve = kCACornerCurveContinuous;
-    self.iconContainer.backgroundColor = [UIColor systemBlueColor];
-    [self.contentContainer addSubview:self.iconContainer];
-
-    self.iconView = [[UIImageView alloc] init];
-    self.iconView.translatesAutoresizingMaskIntoConstraints = NO;
-    self.iconView.contentMode = UIViewContentModeScaleAspectFit;
-    self.iconView.image = [UIImage systemImageNamed:@"folder.fill"];
-    self.iconView.tintColor = [UIColor whiteColor];
-    [self.iconContainer addSubview:self.iconView];
-
-    self.nameLabel = [[UILabel alloc] init];
-    self.nameLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    self.nameLabel.font = [UIFont systemFontOfSize:nameFont weight:UIFontWeightSemibold];
-    // 规范 2.1：系统色
-    self.nameLabel.textColor = [UIColor labelColor];
-    self.nameLabel.numberOfLines = 1;
-    self.nameLabel.adjustsFontForContentSizeCategory = NO;
-    [self.contentContainer addSubview:self.nameLabel];
-
-    self.detailLabel = [[UILabel alloc] init];
-    self.detailLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    self.detailLabel.font = [UIFont systemFontOfSize:[ScreenUtils sp:10] weight:UIFontWeightRegular];
-    // 规范 2.1：副文字 secondaryLabelColor
-    self.detailLabel.textColor = [UIColor secondaryLabelColor];
-    self.detailLabel.numberOfLines = 0;
-    self.detailLabel.lineBreakMode = NSLineBreakByWordWrapping;
-    self.detailLabel.adjustsFontForContentSizeCategory = NO;
-    [self.contentContainer addSubview:self.detailLabel];
-
-    self.selectedBadge = [[UIView alloc] init];
-    self.selectedBadge.translatesAutoresizingMaskIntoConstraints = NO;
-    self.selectedBadge.backgroundColor = accentColor();
-    self.selectedBadge.layer.cornerRadius = 9;
-    self.selectedBadge.layer.cornerCurve = kCACornerCurveContinuous;
-    self.selectedBadge.hidden = YES;
-    [self.contentContainer addSubview:self.selectedBadge];
-
-    UIImageView *checkmark = [[UIImageView alloc] init];
-    checkmark.translatesAutoresizingMaskIntoConstraints = NO;
-    checkmark.image = [UIImage systemImageNamed:@"checkmark" withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:8 weight:UIFontWeightBold]];
-    checkmark.tintColor = [UIColor whiteColor];
-    [self.selectedBadge addSubview:checkmark];
-
-    // 规范 9.4：chevron 暗示可点击
-    self.chevronView = [[UIImageView alloc] init];
-    self.chevronView.translatesAutoresizingMaskIntoConstraints = NO;
-    self.chevronView.image = [UIImage systemImageNamed:@"chevron.right" withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:11 weight:UIFontWeightSemibold]];
-    self.chevronView.tintColor = [UIColor tertiaryLabelColor];
-    [self.contentContainer addSubview:self.chevronView];
-
-    [NSLayoutConstraint activateConstraints:@[
-        [self.iconContainer.leadingAnchor constraintEqualToAnchor:self.contentContainer.leadingAnchor constant:10],
-        [self.iconContainer.centerYAnchor constraintEqualToAnchor:self.contentContainer.centerYAnchor],
-        [self.iconContainer.widthAnchor constraintEqualToConstant:iconBoxSize],
-        [self.iconContainer.heightAnchor constraintEqualToConstant:iconBoxSize],
-        [self.iconView.centerXAnchor constraintEqualToAnchor:self.iconContainer.centerXAnchor],
-        [self.iconView.centerYAnchor constraintEqualToAnchor:self.iconContainer.centerYAnchor],
-        [self.iconView.widthAnchor constraintEqualToConstant:iconSize],
-        [self.iconView.heightAnchor constraintEqualToConstant:iconSize],
-        [self.nameLabel.leadingAnchor constraintEqualToAnchor:self.iconContainer.trailingAnchor constant:8],
-        [self.nameLabel.topAnchor constraintEqualToAnchor:self.contentContainer.topAnchor constant:8],
-        [self.nameLabel.trailingAnchor constraintEqualToAnchor:self.chevronView.leadingAnchor constant:-6],
-        [self.detailLabel.leadingAnchor constraintEqualToAnchor:self.nameLabel.leadingAnchor],
-        [self.detailLabel.topAnchor constraintEqualToAnchor:self.nameLabel.bottomAnchor constant:2],
-        [self.detailLabel.trailingAnchor constraintEqualToAnchor:self.chevronView.leadingAnchor constant:-6],
-        [self.detailLabel.bottomAnchor constraintLessThanOrEqualToAnchor:self.contentContainer.bottomAnchor constant:-8],
-        [self.selectedBadge.trailingAnchor constraintEqualToAnchor:self.contentContainer.trailingAnchor constant:-10],
-        [self.selectedBadge.topAnchor constraintEqualToAnchor:self.contentContainer.topAnchor constant:8],
-        [self.selectedBadge.widthAnchor constraintEqualToConstant:18],
-        [self.selectedBadge.heightAnchor constraintEqualToConstant:18],
-        [self.chevronView.trailingAnchor constraintEqualToAnchor:self.contentContainer.trailingAnchor constant:-10],
-        [self.chevronView.centerYAnchor constraintEqualToAnchor:self.contentContainer.centerYAnchor],
-        [self.chevronView.widthAnchor constraintEqualToConstant:11],
-        [self.chevronView.heightAnchor constraintEqualToConstant:11],
-        [checkmark.centerXAnchor constraintEqualToAnchor:self.selectedBadge.centerXAnchor],
-        [checkmark.centerYAnchor constraintEqualToAnchor:self.selectedBadge.centerYAnchor]
-    ]];
-}
-
-- (void)configureWithName:(NSString *)name detail:(NSString *)detail isSelected:(BOOL)isSelected isAddButton:(BOOL)isAddButton {
-    if (isAddButton) {
-        self.iconView.image = [UIImage systemImageNamed:@"plus"];
-        self.iconView.tintColor = [UIColor whiteColor];
-        self.iconContainer.backgroundColor = [UIColor systemGreenColor];
-        self.nameLabel.text = localize(@"i18n_str_1053", nil);
-        self.detailLabel.text = localize(@"i18n_str_1054", nil);
-        self.selectedBadge.hidden = YES;
-        self.chevronView.hidden = YES;
-        // 规范 5.3：推荐态描边 1.0pt accentColor 0.4
-        self.contentContainer.layer.borderColor = [[UIColor systemGreenColor] colorWithAlphaComponent:0.6].CGColor;
-        self.contentContainer.layer.borderWidth = 1.0;
-        self.contentContainer.backgroundColor = [[UIColor systemGreenColor] colorWithAlphaComponent:0.08];
-        return;
-    }
-
-    self.chevronView.hidden = NO;
-    self.iconView.image = [UIImage systemImageNamed:@"folder.fill"];
-    self.iconView.tintColor = [UIColor whiteColor];
-    self.iconContainer.backgroundColor = [UIColor systemBlueColor];
-    self.nameLabel.text = name;
-    self.detailLabel.text = detail ?: @"";
-    self.selectedBadge.hidden = !isSelected;
-    self.selectedBadge.backgroundColor = accentColor();
-
-    // 规范 9.1：选中态三层强化
-    if (isSelected) {
-        self.contentContainer.layer.borderColor = accentColor().CGColor;
-        self.contentContainer.layer.borderWidth = 1.5;
-        self.contentContainer.backgroundColor = [accentColor() colorWithAlphaComponent:0.10];
-        self.chevronView.tintColor = accentColor();
-    } else {
-        self.contentContainer.layer.borderColor = [[UIColor whiteColor] colorWithAlphaComponent:0.10].CGColor;
-        self.contentContainer.layer.borderWidth = 0.5;
-        self.contentContainer.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.08];
-        self.chevronView.tintColor = [UIColor tertiaryLabelColor];
-    }
-}
-
-@end
-
 #pragma mark - Renderer Card Cell (图形 API 选择卡片，FCL 风格)
 
 @interface VMRendererCell : VMTileBaseCell
@@ -691,12 +545,10 @@ static NSInteger const kSectionVersions    = 1;
 
 #pragma mark - View Controller
 
-@interface VersionManagerViewController () <UICollectionViewDataSource, UICollectionViewDelegate, UITextFieldDelegate>
+@interface VersionManagerViewController () <UICollectionViewDataSource, UICollectionViewDelegate>
 @property (nonatomic, strong) UICollectionView *collectionView;
 @property (nonatomic, strong) NSArray<NSString *> *profileList;
 @property (nonatomic, strong) NSString *selectedProfile;
-@property (nonatomic, strong) NSMutableArray<NSString *> *gameDirList;
-@property (nonatomic, strong) NSString *currentGameDir;
 // 空状态视图（无版本时显示引导）
 @property (nonatomic, strong) UIView *emptyStateView;
 // 渲染器 section 数据（启动器 native 渲染器库选择，LWJGL 层）
@@ -736,7 +588,6 @@ static NSInteger const kSectionVersions    = 1;
     [self setupNavigationBar];
     [self setupLongPressGesture];
     [self loadProfiles];
-    [self loadGameDirList];
     [self updateEmptyState];
 
     [[NSNotificationCenter defaultCenter] addObserver:self
@@ -838,7 +689,7 @@ static NSInteger const kSectionVersions    = 1;
     return nil;
 }
 
-/// 长按手势：游戏目录卡片弹出操作菜单（切换/删除），版本卡片弹出选择/编辑/删除
+/// 长按手势：版本卡片弹出操作菜单（选择/编辑/删除）
 - (void)setupLongPressGesture {
     UILongPressGestureRecognizer *longPress = [[UILongPressGestureRecognizer alloc]
         initWithTarget:self action:@selector(handleLongPress:)];
@@ -976,12 +827,7 @@ static NSInteger const kSectionVersions    = 1;
     NSIndexPath *indexPath = [self.collectionView indexPathForItemAtPoint:point];
     if (!indexPath) return;
 
-    if (indexPath.section == kSectionGameDir) {
-        // 游戏目录区段：长按弹出切换/删除菜单（不含"新建目录"按钮项）
-        if (indexPath.item >= (NSInteger)self.gameDirList.count) return;
-        NSString *dirName = self.gameDirList[indexPath.item];
-        [self showGameDirActions:dirName];
-    } else if (indexPath.section == kSectionVersions) {
+    if (indexPath.section == kSectionVersions) {
         // 版本卡片区段：长按弹出操作菜单（选择/删除）
         if (indexPath.item >= (NSInteger)self.profileList.count) return;
         [self showProfileActions:self.profileList[indexPath.item]];
@@ -1003,7 +849,6 @@ static NSInteger const kSectionVersions    = 1;
     }
     [PLProfiles updateCurrent];
     [self loadProfiles];
-    [self loadGameDirList];
     [self.collectionView reloadData];
     [self updateEmptyState];
 }
@@ -1025,7 +870,6 @@ static NSInteger const kSectionVersions    = 1;
 - (void)profileChanged {
     [PLProfiles updateCurrent];
     [self loadProfiles];
-    [self loadGameDirList];
     [self.collectionView reloadData];
     [self updateEmptyState];
 }
@@ -1183,7 +1027,6 @@ static NSInteger const kSectionVersions    = 1;
     self.collectionView.contentInset = UIEdgeInsetsMake(topInset, 0, 24, 0);
     self.collectionView.scrollIndicatorInsets = UIEdgeInsetsMake(topInset, 0, 24, 0);
 
-    [self.collectionView registerClass:[VMGameDirCell class] forCellWithReuseIdentifier:@"GameDirCell"];
     [self.collectionView registerClass:[VMVersionCardCell class] forCellWithReuseIdentifier:@"VersionCell"];
     [self.collectionView registerClass:[VMSectionHeaderView class] forSupplementaryViewOfKind:UICollectionElementKindSectionHeader withReuseIdentifier:@"HeaderView"];
 
@@ -1201,29 +1044,7 @@ static NSInteger const kSectionVersions    = 1;
         NSCollectionLayoutBoundarySupplementaryItem *header = [NSCollectionLayoutBoundarySupplementaryItem boundarySupplementaryItemWithLayoutSize:headerSize elementKind:UICollectionElementKindSectionHeader alignment:NSRectAlignmentTop];
         header.contentInsets = NSDirectionalEdgeInsetsMake(0, 0, 0, 0);
 
-        if (sectionIndex == kSectionGameDir) {
-            // 游戏目录区段：横向滚动卡片列表
-            // 规范 4.1：卡片宽度 160pt（iPad 180pt），高度 70pt（给图标容器留呼吸空间）
-            CGFloat itemWidth = isiPad ? 180 : 160;
-            CGFloat itemHeight = 70;
-            NSCollectionLayoutSize *itemSize = [NSCollectionLayoutSize sizeWithWidthDimension:[NSCollectionLayoutDimension absoluteDimension:itemWidth]
-                                                                                       heightDimension:[NSCollectionLayoutDimension absoluteDimension:itemHeight]];
-            NSCollectionLayoutItem *item = [NSCollectionLayoutItem itemWithLayoutSize:itemSize];
-            // 规范 4.1：卡片间距 8pt（上下各 4pt）
-            item.contentInsets = NSDirectionalEdgeInsetsMake(4, 5, 4, 5);
-
-            NSCollectionLayoutSize *groupSize = [NSCollectionLayoutSize sizeWithWidthDimension:[NSCollectionLayoutDimension absoluteDimension:itemWidth]
-                                                                                          heightDimension:[NSCollectionLayoutDimension absoluteDimension:itemHeight]];
-            NSCollectionLayoutGroup *group = [NSCollectionLayoutGroup horizontalGroupWithLayoutSize:groupSize subitems:@[item]];
-
-            NSCollectionLayoutSection *section = [NSCollectionLayoutSection sectionWithGroup:group];
-            section.orthogonalScrollingBehavior = UICollectionLayoutSectionOrthogonalScrollingBehaviorContinuous;
-            // 规范 4.1：边距 16pt，section 间距 8pt
-            section.contentInsets = NSDirectionalEdgeInsetsMake(0, 16, 8, 16);
-            section.boundarySupplementaryItems = @[header];
-            return section;
-        } else {
-            // 版本卡片区段：紧凑列表（iPad 双列，iPhone 单列）
+        // 版本卡片区段：紧凑列表（iPad 双列，iPhone 单列）
             // 规范 4.1：iPad 双列时增加列间距
             CGFloat itemWidth = isiPad ? 0.5 : 1.0;
             // 规范 4.1：卡片高度 84pt（给 34pt 图标容器 + 三行文字留呼吸空间）
@@ -1245,7 +1066,6 @@ static NSInteger const kSectionVersions    = 1;
             section.contentInsets = NSDirectionalEdgeInsetsMake(0, 16, 24, 16);
             section.boundarySupplementaryItems = @[header];
             return section;
-        }
     }];
 }
 
@@ -1263,97 +1083,29 @@ static NSInteger const kSectionVersions    = 1;
     self.selectedProfile = PLProfiles.current.selectedProfileName;
 }
 
-/// 加载游戏目录（实例）列表
-- (void)loadGameDirList {
-    NSMutableArray *list = [NSMutableArray array];
-    [list addObject:@"default"];
-
-    NSString *instancesPath = [NSString stringWithFormat:@"%s/instances", getenv("POJAV_HOME")];
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSArray *files = [fm contentsOfDirectoryAtPath:instancesPath error:nil];
-    BOOL isDir = NO;
-    for (NSString *file in files) {
-        NSString *fullPath = [instancesPath stringByAppendingPathComponent:file];
-        if ([fm fileExistsAtPath:fullPath isDirectory:&isDir] && isDir && ![file isEqualToString:@"default"]) {
-            [list addObject:file];
-        }
-    }
-    self.gameDirList = list;
-    id raw = getPrefObject(@"general.game_directory");
-    self.currentGameDir = [raw isKindOfClass:[NSString class]] ? raw : @"default";
-}
-
 #pragma mark - UICollectionViewDataSource
 
 - (NSInteger)numberOfSectionsInCollectionView:(UICollectionView *)collectionView {
-    return 2;
+    return 1;
 }
 
 - (NSInteger)collectionView:(UICollectionView *)collectionView numberOfItemsInSection:(NSInteger)section {
-    if (section == kSectionGameDir) {
-        return self.gameDirList.count + 1;  // 末尾追加"新建目录"按钮
-    } else {
-        return self.profileList.count;
-    }
+    return self.profileList.count;
 }
 
 - (UICollectionViewCell *)collectionView:(UICollectionView *)collectionView cellForItemAtIndexPath:(NSIndexPath *)indexPath {
-    if (indexPath.section == kSectionGameDir) {
-        VMGameDirCell *cell = [collectionView dequeueReusableCellWithReuseIdentifier:@"GameDirCell" forIndexPath:indexPath];
+    VMVersionCardCell *cell = [collectionView dequeueReusableCellWithReuseIdentifier:@"VersionCell" forIndexPath:indexPath];
 
-        if (indexPath.item == (NSInteger)self.gameDirList.count) {
-            [cell configureWithName:nil detail:nil isSelected:NO isAddButton:YES];
-            return cell;
-        }
+    NSString *profileName = self.profileList[indexPath.item];
+    NSDictionary *profile = PLProfiles.current.profiles[profileName];
+    NSString *versionId = profile[@"lastVersionId"] ?: localize(@"i18n_str_1052", nil);
+    BOOL isSelected = [profileName isEqualToString:self.selectedProfile];
+    // 版本隔离：任一隔离模式（full / mod）都算已隔离
+    BOOL isolated = ![[PLProfiles isolationModeForProfile:profile] isEqualToString:PLIsolationNone];
+    NSString *lastPlayed = [self formatLastPlayed:profile[@"lastPlayed"]];
 
-        NSString *dirName = self.gameDirList[indexPath.item];
-        BOOL isSelected = [dirName isEqualToString:self.currentGameDir];
-
-        // 异步计算目录大小
-        __weak typeof(self) weakSelf = self;
-        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-            unsigned long long folderSize = 0;
-            NSString *directory = [NSString stringWithFormat:@"%s/instances/%@", getenv("POJAV_HOME"), dirName];
-            [weakSelf calculateFolderSizeAtPath:directory size:&folderSize];
-            NSString *sizeStr = [NSByteCountFormatter stringFromByteCount:folderSize countStyle:NSByteCountFormatterCountStyleMemory];
-            dispatch_async(dispatch_get_main_queue(), ^{
-                VMGameDirCell *targetCell = (VMGameDirCell *)[collectionView cellForItemAtIndexPath:indexPath];
-                if (targetCell && [targetCell isKindOfClass:[VMGameDirCell class]]) {
-                    targetCell.detailLabel.text = sizeStr;
-                }
-            });
-        });
-
-        [cell configureWithName:dirName detail:localize(@"i18n_str_134", nil) isSelected:isSelected isAddButton:NO];
-        return cell;
-    } else {
-        VMVersionCardCell *cell = [collectionView dequeueReusableCellWithReuseIdentifier:@"VersionCell" forIndexPath:indexPath];
-
-        NSString *profileName = self.profileList[indexPath.item];
-        NSDictionary *profile = PLProfiles.current.profiles[profileName];
-        NSString *versionId = profile[@"lastVersionId"] ?: localize(@"i18n_str_1052", nil);
-        BOOL isSelected = [profileName isEqualToString:self.selectedProfile];
-        // 版本隔离：任一隔离模式（full / mod）都算已隔离
-        BOOL isolated = ![[PLProfiles isolationModeForProfile:profile] isEqualToString:PLIsolationNone];
-        NSString *lastPlayed = [self formatLastPlayed:profile[@"lastPlayed"]];
-
-        [cell configureWithName:profileName version:versionId isSelected:isSelected isolated:isolated lastPlayed:lastPlayed];
-        return cell;
-    }
-}
-
-/// 简易目录大小计算（递归）
-- (void)calculateFolderSizeAtPath:(NSString *)path size:(unsigned long long *)size {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSDirectoryEnumerator *enumerator = [fm enumeratorAtPath:path];
-    NSString *relativePath;
-    while ((relativePath = [enumerator nextObject])) {
-        NSString *fullPath = [path stringByAppendingPathComponent:relativePath];
-        NSDictionary *attrs = [fm attributesOfItemAtPath:fullPath error:nil];
-        if (attrs) {
-            *size += [attrs fileSize];
-        }
-    }
+    [cell configureWithName:profileName version:versionId isSelected:isSelected isolated:isolated lastPlayed:lastPlayed];
+    return cell;
 }
 
 /// 将 lastPlayed 时间戳格式化为"最后游玩：xxx"
@@ -1381,12 +1133,6 @@ static NSInteger const kSectionVersions    = 1;
     if (kind == UICollectionElementKindSectionHeader) {
         VMSectionHeaderView *header = [collectionView dequeueReusableSupplementaryViewOfKind:kind withReuseIdentifier:@"HeaderView" forIndexPath:indexPath];
         switch (indexPath.section) {
-            case kSectionGameDir:
-                [header configureWithIcon:@"folder.badge.gearshape"
-                                     title:localize(@"i18n_str_1070", nil)
-                                  subtitle:localize(@"i18n_str_1071", nil)
-                                     count:(NSInteger)self.gameDirList.count];
-                break;
             case kSectionVersions:
                 [header configureWithIcon:@"cube.box.fill"
                                      title:localize(@"i18n_str_1072", nil)
@@ -1410,163 +1156,11 @@ static NSInteger const kSectionVersions    = 1;
 - (void)collectionView:(UICollectionView *)collectionView didSelectItemAtIndexPath:(NSIndexPath *)indexPath {
     [collectionView deselectItemAtIndexPath:indexPath animated:YES];
 
-    if (indexPath.section == kSectionGameDir) {
-        if (indexPath.item == (NSInteger)self.gameDirList.count) {
-            [self showCreateGameDirAlert];
-        } else {
-            NSString *dirName = self.gameDirList[indexPath.item];
-            if (![dirName isEqualToString:self.currentGameDir]) {
-                [self switchGameDirTo:dirName];
-            }
-        }
-    } else if (indexPath.section == kSectionVersions) {
+    if (indexPath.section == kSectionVersions) {
         // 点击版本卡片直接进入该版本的专属设置页（FCL 风格）
         NSString *profileName = self.profileList[indexPath.item];
         [self editProfile:profileName];
     }
-}
-
-#pragma mark - Game Directory Actions
-
-/// 切换游戏目录（实例），重建符号链接
-- (void)switchGameDirTo:(NSString *)name {
-    if (getenv("DEMO_LOCK")) return;
-
-    setPrefObject(@"general.game_directory", name);
-    NSString *multidirPath = [NSString stringWithFormat:@"%s/instances/%@", getenv("POJAV_HOME"), name];
-    NSString *lasmPath = @(getenv("POJAV_GAME_DIR"));
-    NSError *removeError = nil;
-    [NSFileManager.defaultManager removeItemAtPath:lasmPath error:&removeError];
-
-    NSError *linkError = nil;
-    BOOL linkOK = [NSFileManager.defaultManager createSymbolicLinkAtPath:lasmPath
-                                                       withDestinationPath:multidirPath
-                                                                     error:&linkError];
-    if (!linkOK) {
-        NSLog(@"[VersionMgr] createSymbolicLink failed: %@", linkError.localizedDescription);
-        [self showAlert:[NSString stringWithFormat:localize(@"i18n_str_1074", nil), linkError.localizedDescription]];
-        return;
-    }
-    [NSFileManager.defaultManager changeCurrentDirectoryPath:lasmPath];
-    toggleIsolatedPref(NO);
-    [PLProfiles updateCurrent];
-
-    [[NSNotificationCenter defaultCenter] postNotificationName:@"ReloadProfileList" object:nil];
-    [[NSNotificationCenter defaultCenter] postNotificationName:@"SelectedProfileChanged" object:nil];
-
-    [self loadGameDirList];
-    [self loadProfiles];
-    [self.collectionView reloadData];
-    [self updateEmptyState];
-}
-
-/// 弹出新建游戏目录对话框
-- (void)showCreateGameDirAlert {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:localize(@"i18n_str_1075", nil)
-                                                                   message:localize(@"i18n_str_1076", nil)
-                                                            preferredStyle:UIAlertControllerStyleAlert];
-    [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
-        textField.placeholder = localize(@"i18n_str_1077", nil);
-        textField.autocapitalizationType = UITextAutocapitalizationTypeNone;
-        textField.autocorrectionType = UITextAutocorrectionTypeNo;
-        textField.clearButtonMode = UITextFieldViewModeWhileEditing;
-        textField.delegate = self;
-    }];
-    [alert addAction:[UIAlertAction actionWithTitle:localize(@"resman.common.cancel", nil) style:UIAlertActionStyleCancel handler:nil]];
-    [alert addAction:[UIAlertAction actionWithTitle:localize(@"i18n_str_1078", nil) style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-        NSString *name = alert.textFields.firstObject.text;
-        if (name.length == 0) return;
-        [self createGameDirWithName:name];
-    }]];
-
-    if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad) {
-        alert.popoverPresentationController.sourceView = self.view;
-        alert.popoverPresentationController.sourceRect = CGRectMake(self.view.bounds.size.width / 2, self.view.bounds.size.height / 2, 1, 1);
-    }
-    [self presentViewController:alert animated:YES completion:nil];
-}
-
-- (void)createGameDirWithName:(NSString *)name {
-    NSString *dest = [NSString stringWithFormat:@"%s/instances/%@", getenv("POJAV_HOME"), name];
-    NSError *error = nil;
-    if (![NSFileManager.defaultManager createDirectoryAtPath:dest withIntermediateDirectories:YES attributes:nil error:&error]) {
-        [self showAlert:[NSString stringWithFormat:localize(@"i18n_str_1079", nil), error.localizedDescription]];
-        return;
-    }
-    [self switchGameDirTo:name];
-}
-
-/// 长按游戏目录卡片弹出操作菜单：切换/删除当前目录
-- (void)showGameDirActions:(NSString *)dirName {
-    BOOL isSelected = [dirName isEqualToString:self.currentGameDir];
-    BOOL isDefault = [dirName isEqualToString:@"default"];
-
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:dirName
-                                                                   message:isSelected ? localize(@"i18n_str_2029", nil) : localize(@"i18n_str_1081", nil)
-                                                            preferredStyle:UIAlertControllerStyleActionSheet];
-
-    if (!isSelected) {
-        [alert addAction:[UIAlertAction actionWithTitle:localize(@"i18n_str_1081", nil) style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-            [self switchGameDirTo:dirName];
-        }]];
-    }
-
-    // 删除目录（默认目录禁止删除，正在使用的目录需要先切换才能删除）
-    if (!isDefault) {
-        NSString *deleteTitle = isSelected ? localize(@"i18n_str_2030", nil) : localize(@"i18n_str_1083", nil);
-        [alert addAction:[UIAlertAction actionWithTitle:deleteTitle style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
-            if (isSelected) {
-                [self showAlert:localize(@"i18n_str_1084", nil)];
-                return;
-            }
-            [self confirmDeleteGameDir:dirName];
-        }]];
-    }
-
-    [alert addAction:[UIAlertAction actionWithTitle:localize(@"resman.common.cancel", nil) style:UIAlertActionStyleCancel handler:nil]];
-
-    if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad) {
-        alert.popoverPresentationController.sourceView = self.view;
-        alert.popoverPresentationController.sourceRect = CGRectMake(self.view.bounds.size.width / 2, self.view.bounds.size.height / 2, 1, 1);
-        alert.popoverPresentationController.permittedArrowDirections = UIPopoverArrowDirectionAny;
-    }
-    [self presentViewController:alert animated:YES completion:nil];
-}
-
-/// 二次确认删除游戏目录
-- (void)confirmDeleteGameDir:(NSString *)dirName {
-    UIAlertController *confirm = [UIAlertController alertControllerWithTitle:localize(@"i18n_str_1085", nil)
-                                                                     message:[NSString stringWithFormat:localize(@"i18n_str_1086", nil), dirName]
-                                                              preferredStyle:UIAlertControllerStyleAlert];
-    [confirm addAction:[UIAlertAction actionWithTitle:localize(@"resman.common.cancel", nil) style:UIAlertActionStyleCancel handler:nil]];
-    [confirm addAction:[UIAlertAction actionWithTitle:localize(@"i18n_str_457", nil) style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
-        [self deleteGameDir:dirName];
-    }]];
-    [self presentViewController:confirm animated:YES completion:nil];
-}
-
-/// 删除指定游戏目录
-- (void)deleteGameDir:(NSString *)dirName {
-    if ([dirName isEqualToString:@"default"]) {
-        [self showAlert:localize(@"i18n_str_1087", nil)];
-        return;
-    }
-    if ([dirName isEqualToString:self.currentGameDir]) {
-        [self showAlert:localize(@"i18n_str_1084", nil)];
-        return;
-    }
-
-    NSString *dest = [NSString stringWithFormat:@"%s/instances/%@", getenv("POJAV_HOME"), dirName];
-    NSError *error = nil;
-    if (![NSFileManager.defaultManager removeItemAtPath:dest error:&error]) {
-        [self showAlert:[NSString stringWithFormat:localize(@"i18n_str_1088", nil), error.localizedDescription]];
-        return;
-    }
-
-    [self loadGameDirList];
-    [self.collectionView reloadData];
-    [self updateEmptyState];
-    [self showAlert:[NSString stringWithFormat:localize(@"i18n_str_1089", nil), dirName]];
 }
 
 #pragma mark - Renderer Selection (启动器 native 库选择)

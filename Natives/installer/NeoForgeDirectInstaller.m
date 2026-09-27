@@ -358,7 +358,7 @@ NSString *const NeoForgeDirectInstallerErrorDomain = @"NeoForgeDirectInstallerEr
 #pragma mark - Helpers
 
 // 游戏目录：与 JavaLauncher.m 中 [launchTarget isKindOfClass:NSDictionary.class] 分支保持一致
-// 即 $POJAV_HOME/instances/<general.game_directory>/<profile.gameDir>
+// 即 $POJAV_HOME/instances/<profile.gameDir>
 // 但直装时还没有 profile，无法读 gameDir，使用默认 "."
 + (NSString *)gameDirectory {
     const char *env = getenv("POJAV_GAME_DIR");

@@ -1294,12 +1294,9 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
         NSLog(@"[JavaLauncher] GRAPHICS_API is set to %@\n", graphicsApi);
 
         // Setup gameDir：版本隔离由 profile 的 isolation 决定
-        // none/mod → 实例主目录；full → versions/<版本>（或用户自定义隔离目录）
+        // none/mod → 游戏主目录（POJAV_GAME_DIR）；full → versions/<版本>（或用户自定义隔离目录）
         NSDictionary *isolationProfile = PLProfiles.current.selectedProfile ?: @{};
-        gameDir = [NSString stringWithFormat:@"%s/instances/%@/%@",
-            getenv("POJAV_HOME"), getPrefObject(@"general.game_directory"),
-            [PLProfiles effectiveGameDirForProfile:isolationProfile]]
-            .stringByStandardizingPath;
+        gameDir = [[PLProfiles absoluteGameDirForProfile:isolationProfile] stringByStandardizingPath];
         // 按 PCL2 目录结构就绪隔离目录，并对齐"仅 Mod 隔离"的共享 mods 符号链接
         [PLProfiles ensureIsolationDirectoriesForProfile:isolationProfile];
         [PLProfiles alignSharedModsDirectoryForProfile:isolationProfile];

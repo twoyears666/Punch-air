@@ -180,7 +180,6 @@ NSString *const PREF_MOD_MIRROR = @"general.mod_mirror";
     if (global) {
         // Preferences that cannot be isolated
         NSDictionary *general = @{
-            @"game_directory": @"default",
             @"hidden_sidebar": @(realUIIdiom == UIUserInterfaceIdiomPhone),
             @"appicon": @"AppIcon-Light",
             @"ui_layout": @"vs",

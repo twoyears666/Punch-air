@@ -232,34 +232,51 @@ void init_setupCustomControls() {
     generateAndSaveDefaultControlForGamepad();
 }
 
-void init_setupMultiDir() {
-    NSString *multidir = getPrefObject(@"general.game_directory");
-    if (multidir.length == 0) {
-        multidir = @"default";
-        setPrefObject(@"general.game_directory", multidir);
-        NSLog(@"[Pre-init] Game directory was not set. Defaulting to %@ for future use.\n", multidir);
-    } else {
-        NSLog(@"[Pre-init] Restored game directory preference (%@)\n", multidir);
-    }
-
+/// 初始化游戏目录。已废弃多实例：不再有"版本文件夹选择"，也不再建符号链接，
+/// POJAV_GAME_DIR 直接指向 $POJAV_HOME/instances（多版本安装由 versions/ 承载）。
+/// 旧布局（Library/Application Support/minecraft 符号链接 → instances/<实例名>）
+/// 在此做一次性迁移：把 instances/default 下的内容上移到 instances/，并清理旧符号链接。
+void init_setupGameDir() {
     const char *home = getenv("POJAV_HOME");
-    NSString *lasmPath = [NSString stringWithFormat:@"%s/Library/Application Support/minecraft", home];
-    NSString *multidirPath = [NSString stringWithFormat:@"%s/instances/%@", home, multidir];
-
+    NSString *instancesPath = [NSString stringWithFormat:@"%s/instances", home];
+    NSString *legacyDefaultPath = [instancesPath stringByAppendingPathComponent:@"default"];
+    NSString *legacyLinkPath = [NSString stringWithFormat:@"%s/Library/Application Support/minecraft", home];
 
     NSArray *dirsToCreate = @[
         [NSString stringWithFormat:@"%s/.demo", home],
         [NSString stringWithFormat:@"%s/java_runtimes", home],
-        lasmPath.stringByDeletingLastPathComponent,
-        multidirPath
+        instancesPath
     ];
     for (NSString *dir in dirsToCreate) {
         [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
     }
-    [fm removeItemAtPath:lasmPath error:nil];
-    [fm createSymbolicLinkAtPath:lasmPath withDestinationPath:multidirPath error:nil];
-    [fm changeCurrentDirectoryPath:lasmPath];
-    setenv("POJAV_GAME_DIR", lasmPath.UTF8String, 1);
+
+    // 迁移 instances/default/* → instances/*（同名条目保留既有内容，不覆盖）
+    BOOL isDefaultDir = NO;
+    if ([fm fileExistsAtPath:legacyDefaultPath isDirectory:&isDefaultDir] && isDefaultDir) {
+        NSArray *entries = [fm contentsOfDirectoryAtPath:legacyDefaultPath error:nil] ?: @[];
+        for (NSString *entry in entries) {
+            NSString *src = [legacyDefaultPath stringByAppendingPathComponent:entry];
+            NSString *dst = [instancesPath stringByAppendingPathComponent:entry];
+            if ([fm fileExistsAtPath:dst]) {
+                NSLog(@"[Pre-init] 游戏目录迁移：%@ 已存在，跳过 %@", dst, src);
+                continue;
+            }
+            [fm moveItemAtPath:src toPath:dst error:nil];
+        }
+        [fm removeItemAtPath:legacyDefaultPath error:nil];
+        NSLog(@"[Pre-init] 游戏目录迁移：instances/default 内容已上移到 instances/");
+    }
+
+    // 清理旧符号链接，避免留下悬空链接
+    NSDictionary *linkAttrs = [fm attributesOfItemAtPath:legacyLinkPath error:nil];
+    if ([linkAttrs[NSFileType] isEqualToString:NSFileTypeSymbolicLink]) {
+        [fm removeItemAtPath:legacyLinkPath error:nil];
+        NSLog(@"[Pre-init] 游戏目录迁移：已移除旧符号链接 %@", legacyLinkPath);
+    }
+
+    [fm changeCurrentDirectoryPath:instancesPath];
+    setenv("POJAV_GAME_DIR", instancesPath.UTF8String, 1);
 }
 
 void init_setupResolvConf() {
@@ -353,7 +370,7 @@ int main(int argc, char *argv[]) {
     NSLog(@"[Debugging] Debug log enabled: %@", debugLogEnabled ? @"YES" : @"NO");
 
     init_setupResolvConf();
-    init_setupMultiDir();
+    init_setupGameDir();
     toggleIsolatedPref(NO);
     [PLProfiles updateCurrent];
     init_setupAccounts();

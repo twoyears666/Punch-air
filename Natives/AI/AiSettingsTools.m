@@ -41,7 +41,7 @@
                "video.graphics_api（图形 API，实例级，MC 26.2+ 生效：default/prefer_vulkan/prefer_opengl）、"
                "java.allocated_memory（游戏内存 MB，全局）、java.auto_ram（自动分配内存，全局，true/false）、"
                "java.java_args（JVM 参数，全局+实例级覆盖）、general.download_source（下载源，全局：official/bmclapi）、"
-               "general.game_directory（当前游戏目录名，全局）、control.default_ctrl（默认控制布局，全局）。";
+               "control.default_ctrl（默认控制布局，全局）。";
     }
     if ([self.internalName isEqualToString:@"get_setting"]) {
         return @"读取指定设置键的当前值。"
@@ -190,11 +190,6 @@
             @"values": @"official / bmclapi",
             @"note": @"Minecraft 本体下载源（资源类走 Modrinth 自动兜底链）",
         },
-        @"general.game_directory": @{
-            @"scope": @"全局",
-            @"values": @"实例目录名",
-            @"note": @"当前游戏目录；新建实例请用 create_instance 工具，不建议直接改此键",
-        },
         @"control.default_ctrl": @{
             @"scope": @"全局",
             @"values": @"控制布局文件名（不含扩展名）",
@@ -245,9 +240,8 @@
     }
 
     completion([NSString stringWithFormat:
-                @"key: %@\n全局值: %@\n实例生效值（%@）: %@\n当前游戏目录: %@",
-                key, globalDesc, profileName, effectiveDesc,
-                [AiSettingsTools stringFromValue:getPrefObject(@"general.game_directory")]], nil);
+                @"key: %@\n全局值: %@\n实例生效值（%@）: %@",
+                key, globalDesc, profileName, effectiveDesc], nil);
 }
 
 #pragma mark - set_setting
@@ -318,11 +312,6 @@
         NSString *desc = [value isKindOfClass:[NSString class]] ? (NSString *)value : [value description];
         BOOL on = [desc.lowercaseString hasPrefix:@"t"] || [desc isEqualToString:@"1"] || [desc isEqualToString:@"yes"];
         setPrefObject(@"java.auto_ram", @(on));
-    } else if ([key isEqualToString:@"general.game_directory"]) {
-        completion(nil, [NSError errorWithDomain:@"AiTool" code:400
-                                     userInfo:@{NSLocalizedDescriptionKey:
-                                         @"不建议直接修改游戏目录键（涉及符号链接重建）；新建实例请用 create_instance 工具"}]);
-        return;
     } else if ([key isEqualToString:@"general.download_source"] ||
                [key isEqualToString:@"java.java_args"] ||
                [key isEqualToString:@"control.default_ctrl"]) {

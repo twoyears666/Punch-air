@@ -6,7 +6,7 @@
 #import "AiToolBootstrapper.h"
 #import "AiToolRegistry.h"
 
-#import "AiInstancesTool.h"
+#import "AiGameVersionsTool.h"
 #import "AiLogReader.h"
 #import "AiCrashAnalyzer.h"
 #import "AiFileTools.h"
@@ -16,7 +16,6 @@
 #import "AiTodoTool.h"
 #import "AiSleepTool.h"
 #import "AiDownloadProbe.h"
-#import "AiInstanceCreator.h"
 
 @implementation AiToolBootstrapper
 
@@ -25,9 +24,8 @@
 
     // ===== 3a 阶段内置工具 =====
 
-    // 实例/版本工具（list_instances、list_game_versions）
-    [registry registerTool:[[AiInstancesTool alloc] initWithName:@"list_instances"]];
-    [registry registerTool:[[AiInstancesTool alloc] initWithName:@"list_game_versions"]];
+    // 版本工具（list_game_versions）
+    [registry registerTool:[[AiGameVersionsTool alloc] init]];
 
     // 日志读取工具（read_latest_log、read_crash_report）
     [registry registerTool:[[AiLogReader alloc] initWithName:@"read_latest_log"]];
@@ -86,9 +84,6 @@
 
     // sleep（ReadOnly，无副作用）
     [registry registerTool:[[AiSleepTool alloc] init]];
-
-    // 新建游戏目录实例（ControlledWrite）
-    [registry registerTool:[[AiInstanceCreator alloc] init]];
 }
 
 @end

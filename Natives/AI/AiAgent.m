@@ -176,11 +176,11 @@ static NSString * const kAiSessionMessagesDidChangeNotification = @"AiSessionMes
     NSMutableArray *payloadMessages = [NSMutableArray array];
     NSString *systemPrompt = [[AiSettings sharedSettings] systemPrompt];
 
-    // 动态注入今天日期（gameDir 自动命名「MC版本 加载器 YYYY.MM.DD」需要）
+    // 动态注入今天日期
     NSDateFormatter *dateFmt = [[NSDateFormatter alloc] init];
     dateFmt.locale = [[NSLocale alloc] initWithLocaleIdentifier:@"zh_CN"];
     [dateFmt setDateFormat:@"yyyy 年 M 月 d 日"];
-    NSString *todayLine = [NSString stringWithFormat:@"今天是 %@。若需新建游戏目录，命名格式为「Minecraft版本 加载器 YYYY.MM.DD」。", [dateFmt stringFromDate:[NSDate date]]];
+    NSString *todayLine = [NSString stringWithFormat:@"今天是 %@。", [dateFmt stringFromDate:[NSDate date]]];
     systemPrompt = [systemPrompt stringByAppendingString:[NSString stringWithFormat:@"\n\n【今天日期】%@", todayLine]];
 
     // 2. 工具定义
@@ -190,9 +190,9 @@ static NSString * const kAiSessionMessagesDidChangeNotification = @"AiSessionMes
     // 若系统提示未点明，模型往往只给文字建议而不主动调用工具。
     // 因此在存在工具时向 system prompt 追加一句明确的能力说明（不覆盖用户自定义内容，仅追加其尾）。
     if (tools.count > 0) {
-        systemPrompt = [systemPrompt stringByAppendingString:@"\n\n你可以调用内置工具来直接操控启动器，例如：排查并分析崩溃日志、读取已安装的游戏版本与组件状态、直接安装 Minecraft 版本或 Fabric/Quilt 加载器（未装原版会自动先装，Fabric 会自动装 Fabric API）、下载/安装模组、光影、资源包、数据包（自动匹配实例 MC 版本）、查看与修改启动器设置（总设置与实例设置）、新建游戏目录（create_instance）、管理待办清单（todo_*）、查看下载进度（check_downloads）、读取多份日志（read_logs，含启动器日志）。"
+        systemPrompt = [systemPrompt stringByAppendingString:@"\n\n你可以调用内置工具来直接操控启动器，例如：排查并分析崩溃日志、读取已安装的游戏版本与组件状态、直接安装 Minecraft 版本或 Fabric/Quilt 加载器（未装原版会自动先装，Fabric 会自动装 Fabric API）、下载/安装模组、光影、资源包、数据包（自动匹配实例 MC 版本）、查看与修改启动器设置（总设置与实例设置）、管理待办清单（todo_*）、查看下载进度（check_downloads）、读取多份日志（read_logs，含启动器日志）。"
             "版本号约定：install_loader 的 loaderVersion 与 install_* 的 versionId 均可传 \"latest\" 表示最新稳定版，无需先拉版本列表。"
-            "安装顺序纪律：必须先装原版再装加载器——调用 install_loader 前先用 list_instances 确认目标实例的原版已装好，未装则先调 install_game_version 装原版，成功后才装加载器，最后才装 Mod；卸载/切换目录同理，先补原版。"
+            "安装顺序纪律：必须先装原版再装加载器——调用 install_loader 前必须先确认目标游戏目录的原版已装好，未装则先调 install_game_version 装原版，成功后才装加载器，最后才装 Mod；卸载同理，先补原版。"
             "这些安装全部自动完成，用户可在下载中心实时查看进度，你无需也不应让用户去下载页手动操作（Forge/NeoForge/OptiFine 除外，它们需要图形安装器）。"
             "你可以并行执行多个工具调用；下载类工具可后台执行（wait=false）后继续做其它事，稍后用 check_downloads 查进度。"
             "当用户的请求可以通过这些工具完成时，请主动调用合适的工具去执行，而不是只给出文字建议；也请结合工具返回结果继续推进任务。"];
