@@ -646,10 +646,12 @@
               @"type": self.typePickField,
               @"enableCondition": whenNotInGame,
               @"pickKeys": @[
+                  @"auto",
                   @"official_first",
                   @"mirror_first"
               ],
               @"pickList": @[
+                  localize(@"preference.title.mirror_policy-auto", nil),
                   localize(@"preference.title.mirror_policy-official_first", nil),
                   localize(@"preference.title.mirror_policy-mirror_first", nil)
               ]
@@ -660,10 +662,12 @@
               @"type": self.typePickField,
               @"enableCondition": whenNotInGame,
               @"pickKeys": @[
+                  @"auto",
                   @"official_first",
                   @"mirror_first"
               ],
               @"pickList": @[
+                  localize(@"preference.title.mirror_policy-auto", nil),
                   localize(@"preference.title.mirror_policy-official_first", nil),
                   localize(@"preference.title.mirror_policy-mirror_first", nil)
               ]
@@ -674,10 +678,12 @@
               @"type": self.typePickField,
               @"enableCondition": whenNotInGame,
               @"pickKeys": @[
+                  @"auto",
                   @"official_first",
                   @"mirror_first"
               ],
               @"pickList": @[
+                  localize(@"preference.title.mirror_policy-auto", nil),
                   localize(@"preference.title.mirror_policy-official_first", nil),
                   localize(@"preference.title.mirror_policy-mirror_first", nil)
               ]
@@ -688,10 +694,12 @@
               @"type": self.typePickField,
               @"enableCondition": whenNotInGame,
               @"pickKeys": @[
+                  @"auto",
                   @"official_first",
                   @"mirror_first"
               ],
               @"pickList": @[
+                  localize(@"preference.title.mirror_policy-auto", nil),
                   localize(@"preference.title.mirror_policy-official_first", nil),
                   localize(@"preference.title.mirror_policy-mirror_first", nil)
               ]
@@ -706,6 +714,14 @@
               @"enableCondition": whenNotInGame,
               @"pickKeys": self.rendererKeys,
               @"pickList": self.rendererList
+            },
+            // SimpleFPEWrapper 固定管线 (GL 1.x) 仿真层，仅叠加在 GLES 后端之上
+            // （MobileGlues / MobileGL-gles）；gl4es、zink、Vulkan 等不适用。
+            @{@"key": @"sfpew_overlay",
+              @"hasDetail": @YES,
+              @"icon": @"square.stack.3d.down.right",
+              @"type": self.typeSwitch,
+              @"enableCondition": whenNotInGame
             },
             @{@"key": @"resolution",
               @"hasDetail": @YES,
@@ -1871,10 +1887,15 @@
         vc.getDefaultCtrl = ^{
             return getPrefObject(@"control.default_ctrl");
         };
-        UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
-        nav.navigationBar.prefersLargeTitles = YES;
-        nav.modalInPresentation = YES;
-        [self.navigationController presentViewController:nav animated:YES completion:nil];
+        // CCVC 是自成一体的全屏编辑器：长按空白处唤出 退出/保存/加载 菜单，
+        // 不需要 UINavigationController。旧代码把它包进 nav 再 present，带来两个
+        // 问题：① 样式只设在 vc 上、真正被 present 的 nav 走默认 pageSheet，
+        // 全屏编辑器于是缩成屏幕中央的一张方形卡片；② CCVC 被包进 nav 后，
+        // 它的子面板 CCMenuViewController 的 presentingViewController 会指向
+        // nav，「完成」向 nav 发 doUpdateButton:from:to: 即闪退。
+        // 这里与游戏内一致：直接 present CCVC，样式设在真正被 present 的对象上。
+        vc.modalInPresentation = YES;
+        [self.navigationController presentViewController:vc animated:YES completion:nil];
         return;
     }
 

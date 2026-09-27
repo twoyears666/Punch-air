@@ -201,6 +201,7 @@
 "preference.detail.modLoaderSource" = "Source policy for Fabric / Forge / NeoForge meta, maven and installer downloads. Mirror first uses the BMCLAPI mirror.";
 "preference.title.mirror_policy-official_first" = "Official First";
 "preference.title.mirror_policy-mirror_first" = "Mirror First";
+"preference.title.mirror_policy-auto" = "Auto (mirror first in mainland China)";
 "preference.title.mod_mirror" = "Mod Mirror Source";
 "preference.detail.mod_mirror" = "Choose the mirror source for mod/shader/resourcepack/datapack/modpack/world API and file downloads. MCIM mirror (mod.mcimirror.top) provides acceleration in China, compatible with both Modrinth and CurseForge APIs.";
 "preference.title.mod_mirror-official" = "Official Source";
@@ -241,6 +242,11 @@
 "preference.title.renderer.debug.zink" = "Zink (Mesa 25.0.7) - exports OpenGL 4.1";
 "preference.title.renderer.debug.ltw" = "LTW - OpenGL Core→ES wrapper (1.17+)";
 "preference.title.renderer.debug.vulkan" = "MoltenVK (26.2+) - exports vulkan 1.4";
+"preference.title.renderer.debug.mithril" = "Mithril（1.17+）- OpenGL 3.3 核心，经 Vulkan/Metal，实验性";
+"preference.title.renderer.debug.mobilegl" = "MobileGL Vulkan（1.17+）- OpenGL 3.3 核心，实验性";
+"preference.title.renderer.debug.mobilegl_gles" = "MobileGL GLES（1.17+）- OpenGL 3.3 核心，经 OpenGL ES，实验性";
+"preference.title.renderer.debug.sfpew" = "SFPEW（≤1.16.x）- 固定管线仿真层，后端默认 MobileGlues，实验性";
+"preference.title.renderer.debug.metal" = "Metal (metallum)";
 
 "preference.detail.renderer" = "Change the OpenGL render engine to use. Zink is temporarily disabled on iOS 16 and later to diagnose issues.";
 

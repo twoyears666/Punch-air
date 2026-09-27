@@ -9,6 +9,20 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <mach/mach.h>
+#include <mach/task_info.h>
+// 独立 native 崩溃捕获（见 ameInstallCrashCapture 处注释）
+#include <execinfo.h>
+#include <fcntl.h>
+#include <mach-o/dyld.h>
+#include <pthread.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <sys/ucontext.h>
+#include <time.h>
+// Task 99：MC 26.3 的 Window.<init> 经 jna-objc 找 NSApplication（AppKit 菜单集成）
+// iOS 无 AppKit，需要在 JLI_Launch 前用 ObjC 运行时注册最小桩类。
+#include <objc/runtime.h>
+#include <objc/message.h>
 #include "utils.h"
 #include "ZinkConfig.h"
 
@@ -34,6 +48,246 @@ BOOL validateVirtualMemorySpace(size_t size) {
     if(map == MAP_FAILED || munmap(map, size) != 0)
         return NO;
     return YES;
+}
+
+#pragma mark - 独立 native 崩溃捕获
+
+// 为什么需要它：游戏闪退时，写 latestlog.txt 的线程随进程一起消失，日志必然
+// 截断在最后一行，永远拿不到崩溃点。此前十几轮排查全是静态对照，正是因为
+// 缺一份真正的 native 栈。这里在进程内直接用 sigaltstack + sigaction 抓栈，
+// 写到 <POJAV_HOME>/native-crash.log（独立于游戏日志，进程被杀也不丢）。
+//
+// 安全约束：signal handler 内只允许 async-signal-safe 操作 —— write、预先
+// 打开的 fd、栈上缓冲。禁止 NSLog / malloc / ObjC / 锁 / 路径拼接。地址到
+// 十六进制的转换自己写（ameCrashU64），不依赖 snprintf。
+//
+// 崩溃后不 _exit，而是依靠 SA_RESETHAND 让 handler 自动恢复为 SIG_DFL：
+// handler 返回后出错指令重新执行并再次触发，此时交给系统默认处理，iOS
+// 「设置 → 隐私与安全性 → 分析数据」里也能同时留下一份标准报告。
+
+#define AME_CRASH_MAX_FRAMES 64
+
+// 前向声明：handler 需要在定义之前引用内存采样与镜像 dump。
+static void ameCrashSampleMemLocked(const char *tag);
+static void ameCrashDumpImagesFrom(uint32_t start);
+
+static int gAmeCrashFd = -1;
+// 已 dump 过的镜像数量（后台采样线程增量追加用）。必须定义在 handler 之前：
+// handler 内会引用它，而 C 不允许引用后面才声明的变量 —— 这正是上一笔
+// CI 编译失败的原因（use of undeclared identifier）。
+static uint32_t gAmeCrashImageCount = 0;
+static void *gAmeCrashAltStack = NULL;
+static size_t gAmeCrashAltStackSize = 0;
+static volatile sig_atomic_t gAmeCrashInHandler = 0;
+
+// 把 v 格式化成 16 位定长十六进制（含前导零），写入 out[17]。
+static void ameCrashU64(char *out, uint64_t v) {
+    static const char digits[] = "0123456789abcdef";
+    for (int i = 15; i >= 0; i--) { out[i] = digits[v & 0xfu]; v >>= 4; }
+    out[16] = '\0';
+}
+
+static void ameCrashWrite(const char *s) {
+    if (gAmeCrashFd >= 0 && s != NULL) write(gAmeCrashFd, s, strlen(s));
+}
+
+// 手写拼接 "label=0xXXXXXXXXXXXXXXXX\n"，全程只用栈上缓冲 + write。
+static void ameCrashLine(const char *label, uint64_t v) {
+    if (gAmeCrashFd < 0) return;
+    char hex[17];
+    char buf[128];
+    size_t n = 0;
+    ameCrashU64(hex, v);
+    for (const char *p = label; *p != '\0' && n < sizeof(buf) - 20; p++) buf[n++] = *p;
+    buf[n++] = '='; buf[n++] = '0'; buf[n++] = 'x';
+    for (int i = 0; i < 16; i++) buf[n++] = hex[i];
+    buf[n++] = '\n';
+    write(gAmeCrashFd, buf, n);
+}
+
+static void ameCrashHandler(int sig, siginfo_t *si, void *ucRaw) {
+    // 递归保护：handler 自身再出错时直接退出，避免无限循环。
+    if (gAmeCrashInHandler) _exit(128 + sig);
+    gAmeCrashInHandler = 1;
+
+    uint64_t pc = 0, sp = 0, fp = 0, lr = 0;
+    ucontext_t *uc = (ucontext_t *)ucRaw;
+#if defined(__arm64__) || defined(__aarch64__)
+    if (uc != NULL && uc->uc_mcontext != NULL) {
+        pc = (uint64_t)uc->uc_mcontext->__ss.__pc;
+        sp = (uint64_t)uc->uc_mcontext->__ss.__sp;
+        fp = (uint64_t)uc->uc_mcontext->__ss.__fp;
+        lr = (uint64_t)uc->uc_mcontext->__ss.__lr;
+    }
+#endif
+
+    ameCrashWrite("\n=== NATIVE CRASH ===\n");
+    ameCrashLine("signal", (uint64_t)(int64_t)sig);
+    ameCrashLine("si_addr", (uint64_t)(uintptr_t)(si != NULL ? si->si_addr : NULL));
+    ameCrashLine("si_code", (uint64_t)(int64_t)(si != NULL ? si->si_code : 0));
+    ameCrashLine("thread", (uint64_t)pthread_mach_thread_np(pthread_self()));
+    ameCrashLine("pc", pc);
+    ameCrashLine("sp", sp);
+    ameCrashLine("fp", fp);
+    ameCrashLine("lr", lr);
+
+    // backtrace 在 arm64 上依赖 frame pointer，可能不完整；原始地址始终写出，
+    // 之后用 dSYM + atos，或按下方 image slide 手工定位。
+    void *frames[AME_CRASH_MAX_FRAMES];
+    int nf = backtrace(frames, AME_CRASH_MAX_FRAMES);
+    ameCrashLine("frames", (uint64_t)(int64_t)nf);
+    for (int i = 0; i < nf && i < AME_CRASH_MAX_FRAMES; i++) {
+        ameCrashLine("  frame", (uint64_t)(uintptr_t)frames[i]);
+    }
+    // best-effort 符号化：非 async-signal-safe，放最后，即使它出问题，前面的
+    // 原始地址也已经落盘。
+    if (gAmeCrashFd >= 0 && nf > 0) backtrace_symbols_fd(frames, nf, gAmeCrashFd);
+    // 崩溃时刻补记内存水位 + 上次采样之后新加载的镜像。两者都不是
+    // async-signal-safe，所以放在最后：即使它们出问题，前面的原始地址已落盘。
+    ameCrashSampleMemLocked("crash");
+    ameCrashDumpImagesFrom(gAmeCrashImageCount);
+    ameCrashWrite("=== END CRASH ===\n");
+}
+
+// 记录已加载镜像清单 + slide：崩溃日志里只有原始地址，没有 slide 就
+// 无法判断 PC 落在哪个 dylib、偏移多少。
+//
+// 2026-09-26 修正：原先只在「装配时」dump 一次，那是 JVM 启动之前，
+// libmobileglues / libshaderc_impl 等全部还没 dlopen，清单里根本没有它们，
+// PC 拿到也无法定位。改为：后台采样线程持续增量追加新镜像，崩溃时再补一次。
+static void ameCrashDumpImagesFrom(uint32_t start) {
+    if (gAmeCrashFd < 0) return;
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = start; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+        dprintf(gAmeCrashFd, "image[%u] slide=0x%016llx %s\n",
+                i, (uint64_t)slide, name != NULL ? name : "(null)");
+    }
+    gAmeCrashImageCount = count;
+}
+
+static void ameCrashDumpImages(void) { ameCrashDumpImagesFrom(0); }
+
+// 写一行内存水位。phys_footprint 是 jetsam 实际据以 kill 的指标，比 RSS 更准。
+// 只在普通线程里调用（dprintf 非 async-signal-safe）。
+static void ameCrashSampleMemLocked(const char *tag) {
+    if (gAmeCrashFd < 0) return;
+    uint64_t footprint = 0, resident = 0;
+#if defined(TASK_VM_INFO)
+    task_vm_info_data_t vminfo;
+    mach_msg_type_number_t vmcnt = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vminfo, &vmcnt) == KERN_SUCCESS) {
+        footprint = vminfo.phys_footprint;
+    }
+#endif
+    mach_task_basic_info_data_t basic;
+    mach_msg_type_number_t bcnt = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&basic, &bcnt) == KERN_SUCCESS) {
+        resident = basic.resident_size;
+    }
+    dprintf(gAmeCrashFd, "mem %s t=%lld footprint=%llu MB resident=%llu MB\n",
+            tag, (long long)time(NULL),
+            (unsigned long long)(footprint / (1024 * 1024)),
+            (unsigned long long)(resident / (1024 * 1024)));
+}
+
+// 后台采样线程：每 2 秒把内存水位和「新增的镜像」直接写盘。
+//
+// 为什么必须持续写而不是等崩溃时再写：如果进程是被 jetsam 用 SIGKILL 杀掉的
+// （内存超限），signal handler 根本不会执行 —— SIGKILL 不可捕获、不可忽略。
+// 那份 26.3 日志就是这种情况：日志装配成功却没有任何崩溃记录。只有把内存
+// 曲线持续落盘，被 SIGKILL 之后才留下最后一段水位可供判断。
+static void *ameCrashSamplerMain(void *arg) {
+    (void)arg;
+    unsigned interval = 2;
+    const char *iv = getenv("AMETHYST_CRASH_SAMPLE_INTERVAL");
+    if (iv != NULL && iv[0] != '\0') {
+        int parsed = atoi(iv);
+        if (parsed >= 1 && parsed <= 60) interval = (unsigned)parsed;
+    }
+    for (;;) {
+        if (gAmeCrashFd >= 0) {
+            ameCrashSampleMemLocked("sample");
+            ameCrashDumpImagesFrom(gAmeCrashImageCount);
+        }
+        sleep(interval);
+    }
+    return NULL;
+}
+
+static void ameCrashDumpEnv(const char *key) {
+    if (gAmeCrashFd < 0) return;
+    const char *v = getenv(key);
+    dprintf(gAmeCrashFd, "env %s=%s\n", key, v != NULL ? v : "(unset)");
+}
+
+// 在 JLI_Launch 之前调用；幂等，重复调用无副作用。
+static void ameInstallCrashCapture(void) {
+    static BOOL installed = NO;
+    if (installed) return;
+    installed = YES;
+
+    const char *off = getenv("AMETHYST_CRASH_CAPTURE");
+    if (off != NULL && off[0] == '0') {
+        NSLog(@"[JavaLauncher] native crash capture disabled (AMETHYST_CRASH_CAPTURE=0)");
+        return;
+    }
+
+    const char *home = getenv("POJAV_HOME");
+    if (home == NULL || home[0] == '\0') home = "/tmp";
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/native-crash.log", home);
+    gAmeCrashFd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (gAmeCrashFd < 0) {
+        NSLog(@"[JavaLauncher] native crash capture unavailable (cannot open %s)", path);
+        return;
+    }
+
+    dprintf(gAmeCrashFd, "\n\n======== LAUNCH %lld ========\n", (long long)time(NULL));
+    ameCrashDumpEnv("AMETHYST_RENDERER");
+    ameCrashDumpEnv("AMETHYST_RENDERER_RTLD_GLOBAL");
+    ameCrashDumpEnv("AMETHYST_PRELOAD_ISOLATE");
+    ameCrashDumpEnv("AMETHYST_SFPEW_BACKEND");
+    ameCrashDumpEnv("SFPEW_EGL");
+    ameCrashDumpEnv("MG_DIR_PATH");
+    ameCrashDumpEnv("POJAV_GAME_DIR");
+    ameCrashDumpImages();
+
+    // 备用信号栈：栈溢出类崩溃时原栈已不可用，handler 必须跑在独立栈上。
+    gAmeCrashAltStackSize = 128 * 1024;
+    gAmeCrashAltStack = mmap(NULL, gAmeCrashAltStackSize, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (gAmeCrashAltStack != MAP_FAILED) {
+        stack_t ss;
+        ss.ss_sp = gAmeCrashAltStack;
+        ss.ss_size = gAmeCrashAltStackSize;
+        ss.ss_flags = 0;
+        sigaltstack(&ss, NULL);
+    } else {
+        gAmeCrashAltStack = NULL;
+    }
+
+    const int sigs[] = { SIGSEGV, SIGBUS, SIGABRT, SIGILL, SIGFPE };
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = ameCrashHandler;
+    // SA_RESETHAND：进入 handler 即自动恢复 SIG_DFL，handler 返回后再次触发时
+    // 由系统默认处理，既有我们的日志也有标准 crash report。
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND;
+    sigemptyset(&sa.sa_mask);
+    for (size_t i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++) {
+        sigaction(sigs[i], &sa, NULL);
+    }
+
+    // 启动后台采样线程：持续把内存水位与新加载镜像写盘。SIGKILL（jetsam 内存
+    // 超限）不可捕获，只有持续落盘才能在那种死法下留下证据。
+    pthread_t sampler;
+    if (pthread_create(&sampler, NULL, ameCrashSamplerMain, NULL) == 0) {
+        pthread_detach(sampler);
+    }
+
+    NSLog(@"[JavaLauncher] native crash capture armed -> %s", path);
 }
 
 void init_loadDefaultEnv() {
@@ -63,16 +317,16 @@ void init_loadDefaultEnv() {
         setenv("MVK_CONFIG_PERFORMANCE_TRACKING", "1", 1);
         setenv("MVK_CONFIG_LOG_LEVEL", "2", 1); // 仍然抑制 info 级别，但 performance log 会输出
         // 尝试强制 present mode 为 IMMEDIATE（不等 vsync）。
-        // MoltenVK 1.2.5+ 支持 MVK_CONFIG_SWAPCHAIN_PRESENT_MODE 环境变量：
-        //   0 = VK_PRESENT_MODE_IMMEDIATE_KHR（不等 vsync，帧率可超屏幕刷新率）
-        //   1 = VK_PRESENT_MODE_MAILBOX_KHR
-        //   2 = VK_PRESENT_MODE_FIFO_KHR（默认，等 vsync）
-        // 实际运行的 MoltenVK 版本为 1.2.9（从 libMoltenVK.dylib 二进制确认），
-        // 支持此环境变量。仓库中的 vk_mvk_moltenvk.h 头文件是旧版本（1.1.2），
-        // 但实际 dylib 已是 1.2.9，环境变量会生效。
-        // 这是 Vulkan 模式帧率解锁的关键：present mode 完全由 vkCreateSwapchainKHR
-        // 选择，而 MC 26.2 的 Vulkan 渲染器可能未正确响应 enableVsync=false。
-        // MoltenVK 1.2.9 在 vkCreateSwapchainKHR 时会读取此环境变量覆盖应用的 presentMode。
+        //
+        // 核实结论（升级到 MoltenVK 1.4.2 时对比二进制确认）：
+        // MVK_CONFIG_SWAPCHAIN_PRESENT_MODE 这个配置项在 MoltenVK 里并不存在——
+        // 1.2.9 与 1.4.2 的 MVK_CONFIG_* 列表中都没有它（只有
+        // MVK_CONFIG_SWAPCHAIN_MAG_FILTER_USE_NEAREST 等少数几项）。
+        // 因此下面这行 setenv 当前不会生效，保留它只为前向兼容，不要依赖它。
+        //
+        // Vulkan 模式的帧率解锁实际由另两层完成（见下方"三层机制"注释）：
+        //   1. Java 层：enableVsync=false + maxFps=260
+        //   2. EGL 层：eglSwapInterval(0) → zink 据此选 IMMEDIATE present mode
         setenv("MVK_CONFIG_SWAPCHAIN_PRESENT_MODE", "0", 1);
         NSLog(@"[JavaLauncher] MoltenVK performance tracking + IMMEDIATE present mode requested for VSync diagnosis");
     } else {
@@ -105,23 +359,24 @@ void init_loadDefaultEnv() {
     //    Mesa 21.0 的 zink 不会动态重建 swapchain，导致帧率锁死在屏幕刷新率。
     //
     // 关于 MoltenVK 配置与 Vulkan 帧率解锁研究：
-    //   实际运行的 MoltenVK 版本为 1.2.9（从 libMoltenVK.dylib 二进制确认）。
-    //   仓库中的 vk_mvk_moltenvk.h 头文件是旧版本（1.1.2, spec 30），
-    //   但实际 dylib 已是 1.2.9，支持 MVK_CONFIG_SWAPCHAIN_PRESENT_MODE 环境变量。
-    //   MoltenVK 1.2.9 在 vkCreateSwapchainKHR 时会读取此环境变量覆盖应用的 presentMode，
-    //   这是 Vulkan 模式帧率解锁的关键机制。
+    //   实际运行的 MoltenVK 版本为 1.4.2（从 libMoltenVK.dylib 二进制确认；
+    //   之前为 1.2.9，本次随 Ynnyny 仓库升级）。
     //   设备是否支持 IMMEDIATE present mode 由 MVKPhysicalDeviceMetalFeatures.presentModeImmediate
     //   自动检测（大多数 iOS 设备支持）。
     //
+    //   注意：MVK_CONFIG_SWAPCHAIN_PRESENT_MODE 并非 MoltenVK 的真实配置项，
+    //   1.2.9 / 1.4.2 中均未实现，设置它不会改变 present mode。
+    //
     //   Vulkan 模式帧率解锁的多层机制：
     //   1. MC 选项层：enableVsync=false + maxFps=260（MC 1.16+ 视 260 为 unlimited）
-    //   2. MoltenVK 配置层：MVK_CONFIG_SWAPCHAIN_PRESENT_MODE=0 → IMMEDIATE present mode
-    //      （MoltenVK 1.2.9 支持，覆盖应用在 vkCreateSwapchainKHR 选择的 presentMode）
+    //   2. EGL 层：eglSwapInterval(0) —— zink（GL→Vulkan）据此在创建 swapchain
+    //      时选择 IMMEDIATE present mode，这是实际生效的那层
     //   3. MC 26.2 兼容：同时写入 maxFps/maxFramerate/framerateLimit 多种选项名
     //
     // 各渲染器的帧率解锁效果：
     // - zink（GL→Vulkan）：通过 eglSwapInterval(0) → IMMEDIATE present mode 完全解锁
-    // - Vulkan（LWJGL3）：MVK_CONFIG_SWAPCHAIN_PRESENT_MODE=0 → IMMEDIATE present mode 完全解锁
+    // - Vulkan（LWJGL3）：无环境变量可用，依赖 MC 自身 enableVsync=false；
+    //                     若锁帧需配合渲染器切换到 zink 走 eglSwapInterval(0)
     // - ANGLE Metal：eglSwapInterval(0) 让 ANGLE 不等 vsync，渲染线程不阻塞
     // - ProMotion 设备：通过 CADisableMinimumFrameDurationOnPhone + preferredFrameRateRange 启用 120Hz
     setenv("POJAV_DISABLE_VSYNC", getPrefBool(@"video.disable_game_vsync") ? "1" : "0", 1);
@@ -173,6 +428,22 @@ void init_loadMobileGluesConfig() {
         [renderer isEqualToString:@ RENDERER_NAME_MTL_ANGLE] ||
         [renderer isEqualToString:@ RENDERER_NAME_VK_ZINK];
 
+    // SFPEW 独立选中（渲染器列表里的 SFPEW 项）时，真后端由 AMETHYST_SFPEW_BACKEND
+    // 决定，缺省 libmobileglues.dylib。此时 MobileGlues 依然会被加载 —— 只是改由
+    // SFPEW 内部 dlopen 成为它的后端 —— 所以 config.json 必须照常写入。
+    //
+    // 漏掉这一步的后果（1.7.10 + SFPEW standalone 真机日志实测）：
+    //     MG_DIR_PATH = /sdcard/MG          ← Android 默认路径，iOS 上不存在
+    //     config.json not loaded, using defaults
+    // 于是 enableExtDirectStateAccess 落回默认 true、maxGlslCacheSize 落回 30、
+    // customGLVersion 变成 (default)，本仓库写入的 MG 偏好在 SFPEW 路径下全部失效，
+    // Task166 的 DSA 默认改关等修复也就完全够不到这一条路径。
+    if (!usesMobileGlues && isSFPEWRenderer(renderer.UTF8String)) {
+        const char *backend = getenv("AMETHYST_SFPEW_BACKEND");
+        if (backend == NULL || backend[0] == '\0') backend = RENDERER_NAME_MOBILEGLUES;
+        usesMobileGlues = (strcmp(backend, RENDERER_NAME_MOBILEGLUES) == 0);
+    }
+
     if (!usesMobileGlues) {
         NSLog(@"[JavaLauncher] MobileGlues config not written (renderer is not mobileglues/auto/vulkan)");
         return;
@@ -200,25 +471,80 @@ void init_loadMobileGluesConfig() {
     // customGLVersion 约束（settings.cpp 第 71-79 行）：>46 截断为 46，<32 且非 0 截断为 32，
     // 33-39 截断为 33，0 使用默认值 40。
     // 因此必须写入十进制数（40, 41, 42, ..., 46），不能写入十六进制 0x040000。
-    config[@"enableExtGL43"] = @1;
-    config[@"enableExtDirectStateAccess"] = @1;
+    // Task 166（对齐 Air）：DSA 默认改为【关】。
+    // Air 三会话 A/B 实锤（同机同模组包同 MobileGlues 2.0.17）：
+    //   enable_ext_direct_state_access=0 → "DSA support not detected" → 全程可玩 + FSR 生效
+    //   =1 → "ARB_direct_state_access detected, enabling DSA" → 黑屏
+    //        （swap 100% 健康 + render-texture 探针全零 + 首秒固定 10 次一次性
+    //         "No context is current"）
+    // 机理：MobileGlues 2.0.17 的 DSA 是 DSAWrapper 模拟层（temporarilyBindFramebuffer
+    // 的状态往返在 FSR1 fb0 重定向下自洽性未经上游验证），MC 26.x 的 DSA 路径一旦
+    // 激活即不再走经典路径。这正是「26.2 可玩、26.3 闪退」的成因。
+    //
+    // 此前本仓库默认为 @1（开启）—— 与 Air 相反，且我曾据此错误地判定
+    // 「Task166 反向迁移对本仓库不适用」。实为 26.3 + MobileGlues 崩溃的直接原因。
+    //
+    // Task 167：存量设备迁移。若偏好里已存 1（旧默认或用户手动开过），
+    // 仅改默认值无效（下方覆盖链会读回 1），故在此显式迁回 0。
+    // 用户日后仍可在设置里手动开回。
+    {
+        id dsaPref = getPrefObject(@"mobileglues.enable_ext_direct_state_access");
+        if (dsaPref && [dsaPref respondsToSelector:@selector(boolValue)] && [dsaPref boolValue]) {
+            setPrefObject(@"mobileglues.enable_ext_direct_state_access", @NO);
+            NSLog(@"[JavaLauncher] Task167: migrated legacy mobileglues.enable_ext_direct_state_access 1 -> 0 "
+                  @"(Air Task166/167: DSA on breaks MC 26.x under MobileGlues)");
+        }
+    }
+    config[@"enableExtDirectStateAccess"] = @0;
     config[@"maxGlslCacheSize"] = @128;
     config[@"customGLVersion"] = @40;  // 十进制 40 = GL 4.0
 
+    // Task158 等价实现（对齐 Air 的 ame158_mg_mobileglues_mode 两档）：
+    //   mode 1（GLES 档）：enableANGLE=3 + customGLVersion=32
+    //   mode 2（OpenGL 4.0 档）：enableANGLE=0 + customGLVersion=40
+    //
+    // 关键前提（读 MobileGlues 的 config/settings.cpp 实证）：
+    // iOS 分支（#if defined(__APPLE__)）在 init_settings() 开头就硬编码
+    // global_settings.angle = AngleMode::Disabled，并且整个分支从不读
+    // enableANGLE 键。也就是说：ANGLE 在 iOS 上恒不生效，
+    // 两个仓库都一样。因此两档之间唯一真正生效的
+    // 差异是 customGLVersion：
+    //   * GL 4.0 → MC/Sodium 生成桌面 GLSL（#version 400 core），必须经 MG 自有的
+    //     glslang→SPIR-V→ESSL 转译链；MC 26.x 的 position_color 顶点着色器
+    //     正是在这条链上 SIGSEGV（无 .ips、无 hs_err，表现为静默闪退）。
+    //   * GL 3.2 → 走 ES 档路径，绕开该转译链。
+    //
+    // 另外：删掉了原写的 enableExtGL43（值 1）。MG 的 Apple 分支
+    // 不读该键，写了也是无效键；而且它与 GL 3.2 档自相
+    // 矛盾（宣称 GL 4.3 能力）。Air 从不写这个键。
+    //
+    // Task158 对齐 Air 的语义修正（Air latestlog 26.3-rc-2 + libmobileglues.dylib 实证）：
+    //   Air 的两档由 *渲染器档位*（ame158_mg_mobileglues_mode）决定，而不是由
+    //   mobileglues.enable_angle 这个开关决定：
+    //     mode 1（mg GLES 后端）  → enableANGLE=3 + customGLVersion=32
+    //     mode 2（mg OpenGL 4.0） → enableANGLE=0 + customGLVersion=40
+    //     mode 0（独立 MobileGlues 直选）→ 不强制，保持默认 customGLVersion=40
+    //   Air 那份 26.3-rc-2 全程可玩日志（swapOK=3402 无崩溃）正是 mode 0：
+    //     mobileglues.enable_angle = 0 -> enableANGLE = 0
+    //     mobileglues.custom_gl_version = 0 (raw) -> customGLVersion = 40
+    //     [Render thread] Using graphics backend OpenGL, using drivers: 4.0.0 MobileGlues 2.0.17
+    //
+    // 本函数只在 renderer 为 libmobileglues / auto / vulkan 时执行，即 Air 的 mode 0
+    // 场景，因此必须保持默认 40（GL 4.0）。
+    //
+    // 此前把 enable_angle 开关直接绑成 GLES 档（angleOn → 32）是错误的映射：
+    // 存量设备上 enable_angle=YES 会把 26.3 的驱动版本压到 GL 3.2，
+    // 而 26.3 在 GL 4.0 下才走通（26.2 不受影响，故表现为"26.2 可玩、26.3 闪退"）。
+    // 现在 enable_angle 只写 enableANGLE 键（iOS 上 MG 不读该键，仅作记录），
+    // 不再降级 customGLVersion。需要 GL 3.2 的用户请在设置里显式选择
+    // mobileglues.custom_gl_version = 3.2（下方透传逻辑照常生效，与 Air 一致）。
     id enableAngle = getPrefObject(@"mobileglues.enable_angle");
-    if (enableAngle) {
-        // MobileGlues AngleConfig 枚举（settings.h）：
-        //   0 = DisableIfPossible
-        //   1 = EnableIfPossible  ← iOS 上 hasVulkan12() 永远返回 0（#ifndef __APPLE__
-        //                            块被跳过），导致 checkIfANGLESupported 返回 false，
-        //                            ANGLE 被禁用。不能使用此值。
-        //   2 = ForceDisable
-        //   3 = ForceEnable       ← 强制启用，绕过 GPU 检测
-        // 用户启用 enable_angle 时写入 3 (ForceEnable)，禁用时写入 0 (DisableIfPossible)
-        config[@"enableANGLE"] = [enableAngle boolValue] ? @3 : @0;
-        NSLog(@"[JavaLauncher]   mobileglues.enable_angle = %@ -> enableANGLE = %@ (3=ForceEnable, 0=DisableIfPossible)",
-              enableAngle, config[@"enableANGLE"]);
-    }
+    BOOL angleOn = [enableAngle respondsToSelector:@selector(boolValue)] && [enableAngle boolValue];
+    config[@"enableANGLE"] = angleOn ? @3 : @0;
+    NSLog(@"[JavaLauncher] Task158: mg backend -> MobileGlues mode 0 (直选) -- enableANGLE=%@, "
+          @"customGLVersion=%@ (Air 对齐：mode 0 不强制，保持 GL 4.0 默认；"
+          @"enableANGLE 在 iOS 上被 MG settings.cpp Apple 分支硬编码忽略)",
+          config[@"enableANGLE"], config[@"customGLVersion"]);
 
     id enableNoError = getPrefObject(@"mobileglues.enable_no_error");
     if (enableNoError) {
@@ -252,8 +578,35 @@ void init_loadMobileGluesConfig() {
 
     id multidrawMode = getPrefObject(@"mobileglues.multidraw_mode");
     if (multidrawMode) {
-        config[@"multidrawMode"] = @([multidrawMode intValue]);
-        NSLog(@"[JavaLauncher]   mobileglues.multidraw_mode = %@ -> multidrawMode = %@", multidrawMode, config[@"multidrawMode"]);
+        // Task 79（对齐参考仓库）：MG 2.0.16 起多重绘制后端选择改为"优先序"
+        // 机制——config 键 multidrawOrder（逗号分隔、best-first，全局序可含
+        // 伪项 native=各入口同形的 GLES core/EXT 函数；每入口可用
+        // multidrawOrder<EntryPoint> 覆盖）。旧的 multidrawMode 整数键已被
+        // 弃用：settings.cpp 只打 legacy 警告、从不读取——此前这里写进去的
+        // 值一直是静默 no-op（用户在 UI 里切"间接/模拟"毫无效果，实际永远
+        // 走 MG 默认序，含 compute 后端）。
+        // 三个既有档位映射为等价的优先序（与 settings.cpp 默认序对齐）：
+        //   0 Auto     = MG 默认序：native/EXT 优先，单调用批量后端优先于
+        //                逐子绘制循环，compute 垫底
+        //   1 Indirect = 间接族优先：multiindirect/indirect 打头（GPU 整批
+        //                提交，转译开销最小），不用 native 伪项
+        //   2 Emulated = CPU 循环优先：unroll/basevertex 打头（最保守，驱动
+        //                缺扩展时的兜底形态）
+        NSString *mdOrder = nil;
+        switch ([multidrawMode intValue]) {
+            case 1:
+                mdOrder = @"multiindirect,indirect,multibasevertex,multiarrays,basevertex,unroll,compute";
+                break;
+            case 2:
+                mdOrder = @"unroll,basevertex,indirect,multiindirect,multibasevertex,multiarrays,compute";
+                break;
+            default:
+                mdOrder = @"native,multiindirect,multibasevertex,multiarrays,indirect,basevertex,unroll,compute";
+                break;
+        }
+        config[@"multidrawOrder"] = mdOrder;
+        NSLog(@"[JavaLauncher]   mobileglues.multidraw_mode = %@ -> multidrawOrder = %@ (旧键 multidrawMode 已被 MG 2.0.16+ 弃用，不再写入)",
+              multidrawMode, mdOrder);
     }
 
     id angleDepthClearFixMode = getPrefObject(@"mobileglues.angle_depth_clear_fix_mode");
@@ -355,11 +708,308 @@ void init_loadCustomJvmFlags(int* argc, const char** argv) {
     }
 }
 
+// 进程内 JVM 只能创建一次（第二次 JLI_Launch 会崩溃）。
+// launchJVM 与 launchHeadlessJVM 在调用 JLI_Launch 前都会置位；
+// launchJVM 检测到该标记时拒绝再次创建 JVM 并引导用户重启 app。
+static BOOL gJvmUsedInProcess = NO;
+
+BOOL JVMUsedInProcess(void) {
+    return gJvmUsedInProcess;
+}
+
+// ============================================================================
+// Task97：把进程 CWD 对齐到游戏目录
+//
+// 桌面启动器永远以 CWD == 游戏目录启动 java，本启动器只传 -Duser.dir=<gameDir>
+// 却从未 chdir，于是 java.io（按进程 CWD 解析相对路径）与 java.nio（按
+// user.dir 解析）两套相对路径各看各的目录，mod 一旦混用两者就会崩：
+//   * folder.toFile().listFiles() → NULL → Arrays.stream(null) → NPE；
+//   * Files.createDirectories("config/x.json5") 命中整合包自带同名「文件」
+//     → FileAlreadyExistsException。
+// 失败策略：chdir 失败仅告警不阻断（维持旧行为，日志留 [CwdAlign] 取证）。
+// ============================================================================
+static void ame97_alignProcessCwdToGameDir(NSString *gameDir) {
+    if (gameDir.length == 0) {
+        NSLog(@"[CwdAlign] Task97: gameDir empty, skipping CWD alignment");
+        return;
+    }
+    const char *dir = gameDir.fileSystemRepresentation;
+    if (chdir(dir) != 0) {
+        int savedErrno = errno;
+        NSLog(@"[CwdAlign] Task97: FAILED to chdir(%@) errno=%d -- continuing with unaligned CWD "
+              @"(mods mixing java.io/java.nio relative paths may misbehave)", gameDir, savedErrno);
+        return;
+    }
+    setenv("PWD", dir, 1);
+    NSString *nowCwd = [[NSFileManager defaultManager] currentDirectoryPath];
+    NSLog(@"[CwdAlign] Task97: process CWD aligned to game dir: %@", nowCwd);
+}
+
+// ============================================================================
+// Task98：从任意形态的 version id 里读出 MC 主版本号
+//
+// 旧解析按 "." 切分取 parts[0]，对 Fabric/NeoForge/Forge 前缀形态的 ID 完全
+// 失明："fabric-loader-0.19.5-26.3-e4ecd7db" → parts[0] = "fabric-loader-0"
+// （intValue 0）→ 错选 LWJGL 333 → 333 集合没有 lwjgl-sdl.jar →
+// NoClassDefFoundError: org/lwjgl/sdl/SDL（"Loading library SDL" 崩溃）。
+// 此前所有 26.3 装机会话都是原版形态 ID（"26.3-rc2"）恰好读对，整合包首次暴露。
+//
+// 解析口径两层：
+//   1) 1.x 谱系短路：命中 "(?:^|[-_])1\.\d" 即返回 1（挡住
+//      "1.20.1-forge-47.3.0" 的 forge 构建号 47 被年份正则误读为 >= 26）。
+//   2) 年份制主版本："(?:^|[-_])(\d{2})(?=[.w])"
+//      "26.3"→26，"26w14a"→26，"fabric-loader-0.19.5-26.3-e4ecd7db"→26，
+//      "25w45a"→25。[-_] 锚定 + 后随 [.w] 排除 loader 版本段与十六进制哈希段。
+// ============================================================================
+NSInteger ame98_mcMajorFromVersionId(NSString *versionId) {
+    if (![versionId isKindOfClass:[NSString class]] || versionId.length == 0) {
+        return 0;
+    }
+    NSRegularExpression *legacyRegex = [NSRegularExpression
+        regularExpressionWithPattern:@"(?:^|[-_])1\\.\\d" options:0 error:nil];
+    if ([legacyRegex firstMatchInString:versionId
+                                options:0
+                                  range:NSMakeRange(0, versionId.length)]) {
+        return 1;
+    }
+    NSRegularExpression *yearRegex = [NSRegularExpression
+        regularExpressionWithPattern:@"(?:^|[-_])(\\d{2})(?=[.w])" options:0 error:nil];
+    NSTextCheckingResult *match = [yearRegex firstMatchInString:versionId
+                                                        options:0
+                                                          range:NSMakeRange(0, versionId.length)];
+    if (match && match.numberOfRanges >= 2) {
+        return [[versionId substringWithRange:[match rangeAtIndex:1]] integerValue];
+    }
+    return 0;
+}
+
+// SFPEW（固定管线仿真层）适用的 MC 版本判定：仅 GL 1.x 固定管线时代，即 <= 1.16.x。
+// MC 1.17 起渲染切到 GL 3.2 core + shader/VAO，不再有 immediate mode（glBegin/glEnd、
+// 光照、texenv、矩阵栈等），SFPEW 的 fpe_shadergen 无对象可仿真，叠加只带来
+// 多一层转发开销与崩溃风险（26.3 会话实测因此崩于 glCheckFramebufferStatus 垃圾值）。
+// 年份制版本（21wxx 起，含 26.x）一律属于 1.17+，返回 NO。
+static BOOL ameSFPEWSupportsVersionId(NSString *versionId) {
+    if (![versionId isKindOfClass:[NSString class]] || versionId.length == 0) {
+        return NO;
+    }
+    NSRegularExpression *legacyRegex = [NSRegularExpression
+        regularExpressionWithPattern:@"(?:^|[-_])1\\.(\\d+)" options:0 error:nil];
+    NSTextCheckingResult *match = [legacyRegex firstMatchInString:versionId
+                                                          options:0
+                                                            range:NSMakeRange(0, versionId.length)];
+    if (match && match.numberOfRanges >= 2) {
+        NSInteger minor = [[versionId substringWithRange:[match rangeAtIndex:1]] integerValue];
+        return minor <= 16;
+    }
+    // 年份制（26.3 / 25w45a 等）或非 1.x 版本号
+    return NO;
+}
+
+// 解析 profile 的 lwjglVersion 设置为具体的 LWJGL 版本：
+//   "333" / "341" -> 原样使用
+//   "auto"        -> MC 26.x 及以上用 3.4.1，其余用 3.3.3
+//
+// MC 26.3 起窗口与键盘系统从 GLFW 迁到 SDL3，只有 3.4.1 带真正的 SDL3 绑定
+// （lwjgl-sdl.jar 加载真实 libSDL3），因此 26.x 及以上必须选 341。
+// Task98：版本号提取改用 ame98_mcMajorFromVersionId。
+static NSString *ResolveLwjglVersion(NSString *profileValue, NSString *mcVersionId) {
+    if ([profileValue isEqualToString:@"333"] || [profileValue isEqualToString:@"341"]) {
+        return profileValue;
+    }
+    NSInteger mcMajor = ame98_mcMajorFromVersionId(mcVersionId);
+    if (mcMajor >= 26) {
+        NSLog(@"[LWJGLSel] Task98: MC major %ld extracted from version id \"%@\" -> LWJGL 341 (SDL3 bindings)",
+              (long)mcMajor, mcVersionId);
+        return @"341";
+    }
+    return @"333";
+}
+
+// 把 "libXxx.dylib" 形式的磁盘文件名转成 LWJGL 期望的"裸名"（"Xxx"）。
+//
+// LWJGL 加载 native 库时（Platform.mapLibraryName 的 macOS 分支）先用正则
+//     (?:^|/)lib\w+(?:[.]\d+)*[.]dylib$
+// 判断传入的 libname 是否"已经是 dylib 文件名"：是则原样使用，否则交给
+// System.mapLibraryName 补 "lib" 前缀与 ".dylib" 后缀。
+//
+// 问题在 \w 不含连字符：像 "libMobileGL-gles.dylib" 这种带 '-' 的文件名反而不匹配该
+// 正则，被当成裸名再补一层 -> "liblibMobileGL-gles.dylib.dylib"，磁盘上没有这个文件，
+// 于是 UnsatisfiedLinkError。名字里没有连字符的库（mobileglues / OSMesa.8 / gl4es_114
+// / MobileGL / MoltenVK 等）恰好都能匹配，所以长期只有 GLES 这一个库受影响。
+//
+// 传裸名则一定安全：裸名不以 "lib" 开头，必定不匹配该正则，统一走 System.mapLibraryName
+// 补回前缀后缀，结果与磁盘文件名逐字一致，且不依赖文件名里是否有特殊字符。
+static NSString *lwjglBareLibName(const char *fileName) {
+    if (fileName == NULL) {
+        return nil;
+    }
+    NSString *name = [NSString stringWithUTF8String:fileName];
+    // "lib".length == 3，".dylib".length == 6，合计 9。
+    if (name.length > 9 && [name hasPrefix:@"lib"] && [name hasSuffix:@".dylib"]) {
+        return [name substringWithRange:NSMakeRange(3, name.length - 9)];
+    }
+    // 不是标准命名（例如别名）就原样返回，保持原有行为。
+    return name;
+}
+
+// ============================================================================
+// Task 99 / Task 100：MC 26.3 正式版 Window 初始化的 AppKit 菜单集成崩溃
+//
+// 现象：MC 26.3 正式版在 Window.<init> → MacosUtil.disableCloseWindowMenuItem
+// 经 jna-objc Client.sendProxy("NSApplication","sharedApplication") 起步，随后
+// 走 mainMenu → numberOfItems → itemAtIndex: → submenu → title → setEnabled:
+// 的标准菜单巡游。iOS 只有 UIKit 没有 AppKit，objc_getClass("NSApplication")
+// 落空，jna-objc 抛 NoSuchMethodException，MC 以 "Initializing game" 崩溃。
+// 与渲染器无关（崩在任何 GL 呈现之前）。26.3-rc-3 及更早无此调用。
+//
+// 修复：JLI_Launch 前用 ObjC 运行时公开 API 注册三个最小桩类
+// （objc_allocateClassPair + class_addMethod + objc_registerClassPair）：
+//   NSApplication : +sharedApplication / -mainMenu / -windowsMenu(等菜单出口)
+//   NSMenu        : -numberOfItems → 0（巡游零次即返回）
+//   NSMenuItem    : -title → @""，-submenu → nil，-setEnabled: → 无操作
+// 守卫：仅当 objc_getClass("NSApplication") == NULL 时注册（真 macOS 永不触碰）。
+// 安全网：三个桩类都装 +resolveInstanceMethod: —— 触到未实现选择子时动态补一个
+// 返回 nil 的无操作 IMP 并留痕（优于 doesNotRecognizeSelector 硬崩溃）。
+// Task 100 补记：只补 sharedApplication 不够，MacosUtil 接着取 windowsMenu，
+// nil 被 jna-objc 包成 Java null，MacosUtil.java:27 第一句 sendInt 即 NPE
+// （"Cannot invoke Proxy.sendInt because windowsMenu is null"）。
+// ============================================================================
+static id ame99_shared_app_stub(void);
+static id ame99_shared_menu_stub(void);
+
+static id ame99_app_sharedApplication(id self, SEL _cmd) { return ame99_shared_app_stub(); }
+static id ame99_app_mainMenu(id self, SEL _cmd) { return ame99_shared_menu_stub(); }
+
+// Task 100：NSApplication 的全部菜单出口都返回共享菜单桩
+// （numberOfItems=0 → 巡游零次返回，MacosUtil 的 sendInt 不再踩空）
+static id ame99_app_windowsMenu(id self, SEL _cmd) {
+    static bool s_logged = false;
+    if (!s_logged) {
+        s_logged = true;
+        NSLog(@"[AppKitStub] Task100: windowsMenu requested -> NSMenu stub returned "
+              @"(MacosUtil.java:27 NPE fixed; menu walk no-ops)");
+    }
+    return ame99_shared_menu_stub();
+}
+static NSArray *ame99_app_windows(id self, SEL _cmd) { return @[]; }
+static long ame99_menu_numberOfItems(id self, SEL _cmd) { return 0; }
+static id ame99_menu_itemAtIndex(id self, SEL _cmd, long index) { return nil; }
+static NSString *ame99_any_title(id self, SEL _cmd) { return @""; }
+static BOOL ame99_item_isEnabled(id self, SEL _cmd) { return NO; }
+static id ame99_item_submenu(id self, SEL _cmd) { return nil; }
+static void ame99_noop_vBB(id self, SEL _cmd, BOOL b) {}
+static void ame99_noop_vq(id self, SEL _cmd, long q) {}
+static void ame99_noop_v_id(id self, SEL _cmd, id o) {}
+
+// 兜底 IMP：任何未预期选择子 → 返回 nil
+static id ame99_generic_nil(id self, SEL _cmd) { return nil; }
+
+// 安全网：未实现选择子 → 动态补无操作 IMP（返回 nil）+ 留痕
+static BOOL ame99_resolveInstanceMethod(Class self, SEL _cmd, SEL name) {
+    NSLog(@"[AppKitStub] Task99: unexpected selector <%s> on %s -- generic nil no-op installed "
+          "(extend the stub if MC misbehaves)", sel_getName(name), class_getName(self));
+    if (!class_addMethod(self, name, (IMP)ame99_generic_nil, "@@:")) return NO;
+    return YES;
+}
+
+static id ame99_shared_app_stub(void) {
+    static id sApp = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Class cls = objc_getClass("NSApplication");
+        if (cls) sApp = class_createInstance(cls, 0);
+    });
+    return sApp;
+}
+
+static id ame99_shared_menu_stub(void) {
+    static id sMenu = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Class cls = objc_getClass("NSMenu");
+        if (cls) sMenu = class_createInstance(cls, 0);
+    });
+    return sMenu;
+}
+
+static void ame99_installAppKitMenuStubs(void) {
+    static bool installed = false;
+    if (installed) return;
+    installed = true;
+
+    if (objc_getClass("NSObject") == NULL) {
+        NSLog(@"[AppKitStub] Task99: ObjC runtime unavailable, skipping");
+        return;
+    }
+    if (objc_getClass("NSApplication") != NULL) {
+        NSLog(@"[AppKitStub] Task99: real AppKit present, stubs not needed");
+        return;
+    }
+
+    // —— NSMenu（先建：NSApplication.mainMenu 要返回它）
+    Class menuCls = objc_allocateClassPair(objc_getClass("NSObject"), "NSMenu", 0);
+    if (menuCls) {
+        class_addMethod(menuCls, @selector(numberOfItems), (IMP)ame99_menu_numberOfItems, "q@:");
+        class_addMethod(menuCls, @selector(itemAtIndex:), (IMP)ame99_menu_itemAtIndex, "@@:q");
+        class_addMethod(menuCls, @selector(title), (IMP)ame99_any_title, "@@:");
+        class_addMethod(menuCls, @selector(setTitle:), (IMP)ame99_noop_v_id, "v@:@");
+        class_addMethod(menuCls, @selector(setAutoenablesItems:), (IMP)ame99_noop_vBB, "v@:B");
+        class_addMethod(menuCls, @selector(removeItemAtIndex:), (IMP)ame99_noop_vq, "v@:q");
+        class_addMethod(menuCls, @selector(addItem:), (IMP)ame99_noop_v_id, "v@:@");
+        class_addMethod(object_getClass(menuCls), @selector(resolveInstanceMethod:),
+                        (IMP)ame99_resolveInstanceMethod, "B@::");
+        objc_registerClassPair(menuCls);
+    }
+
+    // —— NSMenuItem
+    Class itemCls = objc_allocateClassPair(objc_getClass("NSObject"), "NSMenuItem", 0);
+    if (itemCls) {
+        class_addMethod(itemCls, @selector(title), (IMP)ame99_any_title, "@@:");
+        class_addMethod(itemCls, @selector(setTitle:), (IMP)ame99_noop_v_id, "v@:@");
+        class_addMethod(itemCls, @selector(setEnabled:), (IMP)ame99_noop_vBB, "v@:B");
+        class_addMethod(itemCls, @selector(isEnabled), (IMP)ame99_item_isEnabled, "B@:");
+        class_addMethod(itemCls, @selector(submenu), (IMP)ame99_item_submenu, "@@:");
+        class_addMethod(itemCls, @selector(setSubmenu:), (IMP)ame99_noop_v_id, "v@:@");
+        class_addMethod(object_getClass(itemCls), @selector(resolveInstanceMethod:),
+                        (IMP)ame99_resolveInstanceMethod, "B@::");
+        objc_registerClassPair(itemCls);
+    }
+
+    // —— NSApplication
+    Class appCls = objc_allocateClassPair(objc_getClass("NSObject"), "NSApplication", 0);
+    if (appCls) {
+        class_addMethod(object_getClass(appCls), @selector(sharedApplication),
+                        (IMP)ame99_app_sharedApplication, "@@:");
+        class_addMethod(appCls, @selector(mainMenu), (IMP)ame99_app_mainMenu, "@@:");
+        // Task 100：菜单访问器全家族（windowsMenu 是实锤崩溃点；其余同族预防补齐）
+        class_addMethod(appCls, @selector(windowsMenu), (IMP)ame99_app_windowsMenu, "@@:");
+        class_addMethod(appCls, @selector(appleMenu), (IMP)ame99_app_windowsMenu, "@@:");
+        class_addMethod(appCls, @selector(helpMenu), (IMP)ame99_app_windowsMenu, "@@:");
+        class_addMethod(appCls, @selector(servicesMenu), (IMP)ame99_app_windowsMenu, "@@:");
+        class_addMethod(appCls, @selector(setMainMenu:), (IMP)ame99_noop_v_id, "v@:@");
+        class_addMethod(appCls, @selector(windows), (IMP)ame99_app_windows, "@@:");
+        class_addMethod(appCls, @selector(delegate), (IMP)ame99_generic_nil, "@@:");
+        class_addMethod(appCls, @selector(setDelegate:), (IMP)ame99_noop_v_id, "v@:@");
+        class_addMethod(object_getClass(appCls), @selector(resolveInstanceMethod:),
+                        (IMP)ame99_resolveInstanceMethod, "B@::");
+        objc_registerClassPair(appCls);
+    }
+
+    NSLog(@"[AppKitStub] Task99: NSApplication/NSMenu/NSMenuItem stubs installed "
+          "(iOS has no AppKit; MC 26.3 MacosUtil menu walk no-ops, numberOfItems=0)");
+}
+
 int launchJVM(NSString *accountId, id launchTarget, int width, int height, int minVersion) {
     NSLog(@"[JavaLauncher] Beginning JVM launch");
 
     init_loadDefaultEnv();
     init_loadCustomEnv();
+
+    // 武装崩溃捕获：游戏闪退时 latestlog.txt 会随进程一起消失，只有这里写的
+    // native-crash.log 能留下崩溃栈。
+    // 必须放在 init_loadCustomEnv() 之后 —— 否则读不到用户在设置里填的
+    // AMETHYST_CRASH_CAPTURE=0。仍在 JLI_Launch 之前，启动期崩溃一样能抓到。
+    ameInstallCrashCapture();
 
     // 同步自 catsruledogs：刷新 JIT flags，决定是否需要 Debug JIT Mapping
     // 使用 DeviceNeedsDebugJITMapping() 基于 JIT_FLAG_IS_IOS_26 | JIT_FLAG_FORCE_MIRRORED
@@ -455,23 +1105,35 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
 
         // Setup AMETHYST_RENDERER
         NSString *renderer = [PLProfiles resolveKeyForCurrentProfile:@"renderer"];
-        // Java 21 / Minecraft 1.21.x compatibility:
-        // - ANGLE and OSMesa can create an incomplete framebuffer on this iOS path.
-        // - OSMesa can also race CoreAnimation while resizing/presenting.
-        // MobileGlues is the stable backend confirmed by the same launch logs.
-        // Keep explicit legacy choices for Java 8/17, but use the stable backend for Java 21+.
-        BOOL unstableModernRenderer =
-            [renderer isEqualToString:@"auto"] ||
-            [renderer isEqualToString:@ RENDERER_NAME_GL4ES] ||
-            [renderer isEqualToString:@ RENDERER_NAME_MTL_ANGLE] ||
-            [renderer isEqualToString:@ RENDERER_NAME_VK_ZINK];
-        if (minVersion >= 21 && unstableModernRenderer) {
-            NSLog(@"[JavaLauncher] Renderer %@ is unstable on Java %d; falling back to MobileGlues",
-                  renderer, minVersion);
-            renderer = @ RENDERER_NAME_MOBILEGLUES;
-        } else if (minVersion >= 17 && [renderer isEqualToString:@ RENDERER_NAME_GL4ES]) {
-            NSLog(@"[JavaLauncher] GL4ES is unsafe on Java %d; falling back to ANGLE", minVersion);
-            renderer = @ RENDERER_NAME_MTL_ANGLE;
+        // Metal 渲染器（libmetallum.dylib）：图形后端由 metallum agent 走原生 Metal
+        // （直接 MTLDevice），不经过 EGL 渲染器。渲染器回落 auto（→ANGLE）仅为
+        // Surface 提供 GL 上下文，与 metallum 官方集成一致（渲染器只管 GL/Vulkan
+        // 回退）。★ 必须置 AMETHYST_METAL=1：agent 只认这个开关来打开渲染 patch
+        // （MetallumAgent.IS_METAL_RENDERER），否则整段渲染 patch 关闭 ——
+        // 日志 "non-Metal renderer: ... render patches disabled"，26.2 起不来。
+        if ([renderer isEqualToString:@ RENDERER_NAME_METAL]) {
+            setenv("AMETHYST_METAL", "1", 1);
+            NSLog(@"[JavaLauncher] Metal renderer selected: AMETHYST_METAL=1 (EGL renderer falls back to auto for surface)");
+            renderer = @"auto";
+        } else {
+            // Java 21 / Minecraft 1.21.x compatibility:
+            // - ANGLE and OSMesa can create an incomplete framebuffer on this iOS path.
+            // - OSMesa can also race CoreAnimation while resizing/presenting.
+            // MobileGlues is the stable backend confirmed by the same launch logs.
+            // Keep explicit legacy choices for Java 8/17, but use the stable backend for Java 21+.
+            BOOL unstableModernRenderer =
+                [renderer isEqualToString:@"auto"] ||
+                [renderer isEqualToString:@ RENDERER_NAME_GL4ES] ||
+                [renderer isEqualToString:@ RENDERER_NAME_MTL_ANGLE] ||
+                [renderer isEqualToString:@ RENDERER_NAME_VK_ZINK];
+            if (minVersion >= 21 && unstableModernRenderer) {
+                NSLog(@"[JavaLauncher] Renderer %@ is unstable on Java %d; falling back to MobileGlues",
+                      renderer, minVersion);
+                renderer = @ RENDERER_NAME_MOBILEGLUES;
+            } else if (minVersion >= 17 && [renderer isEqualToString:@ RENDERER_NAME_GL4ES]) {
+                NSLog(@"[JavaLauncher] GL4ES is unsafe on Java %d; falling back to ANGLE", minVersion);
+                renderer = @ RENDERER_NAME_MTL_ANGLE;
+            }
         }
         NSLog(@"[JavaLauncher] RENDERER is set to %@\n", renderer);
         setenv("AMETHYST_RENDERER", renderer.UTF8String, 1);
@@ -506,6 +1168,107 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
             setenv("POJAVEXEC_EGL", RENDERER_NAME_LTW, 1);
             NSLog(@"[JavaLauncher] LTW renderer active: using LTW defaults (same as Android)");
         }
+
+        // Apply MobileGL-specific environment variables
+        // MobileGL（MobileGL-Dev，LGPL-3.0）两个变体共用同一个 libMobileGL.dylib 二进制，
+        // 靠 MOBILEGL_BACKEND_TYPE 在运行时选择后端：
+        //   libMobileGL.dylib      -> DirectVulkan (GL -> Vulkan -> MoltenVK -> Metal)
+        //   libMobileGL-gles.dylib -> DirectGLES   (GL -> OpenGL ES)
+        // 必须在 JVM 启动前设置：MobileGL 的 constructor 在 dlopen 时就读取该变量。
+        //
+        // MOBILEGL_LOG_FILE_PATH 指向 POJAV_HOME 下的 mobilegl.log，便于导出诊断。
+        // 日志量较大，仅在选中 MobileGL 时开启。
+        if (isMobileGLRenderer(renderer.UTF8String)) {
+            const char *backend = [renderer isEqualToString:@ RENDERER_NAME_MOBILEGL_GLES]
+                ? "DirectGLES" : "DirectVulkan";
+            setenv("MOBILEGL_BACKEND_TYPE", backend, 1);
+            const char *pojavHome = getenv("POJAV_HOME");
+            if (pojavHome && *pojavHome) {
+                NSString *logPath = [NSString stringWithFormat:@"%s/mobilegl.log", pojavHome];
+                setenv("MOBILEGL_LOG_FILE_PATH", logPath.UTF8String, 1);
+            }
+            NSLog(@"[JavaLauncher] MobileGL renderer active: backend=%s", backend);
+        } else {
+            // 切换渲染器后清掉，避免残留影响后续启动
+            unsetenv("MOBILEGL_BACKEND_TYPE");
+            unsetenv("MOBILEGL_LOG_FILE_PATH");
+        }
+
+        // SimpleFPEWrapper（MobileGL-Dev，LGPL-3.0）—— 固定管线 (GL 1.x) 仿真层。
+        // 与安卓 feat/sfpew_angle 同款接入：安卓把 LWJGL 实际加载的 renderLibrary
+        // 换成 libSimpleFPEWrapper.so 并用 SFPEW_EGL 指向真后端（默认 MobileGlues）；
+        // iOS 侧 AMETHYST_RENDERER 已经是最终被 dlopen 的库名，所以这里只需要把
+        // 后端 EGL 路径写进 SFPEW_EGL —— SFPEW 的 init 会 dlopen 它并通过
+        // eglGetProcAddress 取回全部 GL 入口点。
+        // 后端可用 AMETHYST_SFPEW_BACKEND 覆盖，缺省 libmobileglues.dylib。
+        // 叠加模型（对齐安卓 Tools.useSFPEW）：默认开启，作用于 GLES 后端渲染器。
+        // 安卓是"保留 POJAVEXEC_EGL 指向真后端 + 把 renderLibrary 换成
+        // libSimpleFPEWrapper.so"；iOS 侧 AMETHYST_RENDERER 同时决定 LWJGL 加载的
+        // GL 库和 EGL 路由，所以这里把它换成 SFPEW，并把真后端写进 SFPEW_EGL /
+        // AMETHYST_SFPEW_BACKEND，由 SFPEW 内部 dlopen 后端并转发。
+        id sfpewPref = getPrefObject(@"video.sfpew_overlay");
+        BOOL sfpewEnabled = NO;
+        if (sfpewPref != nil && [sfpewPref respondsToSelector:@selector(boolValue)]) {
+            sfpewEnabled = [sfpewPref boolValue];
+        } else if (sfpewPref == nil) {
+            // 首次运行落默认（默认关闭），保证设置页开关与实际一致
+            setPrefObject(@"video.sfpew_overlay", @NO);
+        }
+        // 版本门控：SFPEW 只服务 GL 1.x 固定管线，仅对 <= 1.16.x 生效。
+        // 26.x / 25wxx 等年份制版本一律跳过，避免无意义叠加导致崩溃。
+        NSString *sfpewVersionId = nil;
+        if ([launchTarget isKindOfClass:NSDictionary.class]) {
+            sfpewVersionId = [launchTarget[@"id"] description];
+        } else if ([launchTarget isKindOfClass:NSString.class]) {
+            sfpewVersionId = (NSString *)launchTarget;
+        }
+        if (sfpewVersionId.length == 0) {
+            sfpewVersionId = [PLProfiles.current.selectedProfile[@"lastVersionId"] description];
+        }
+        BOOL sfpewVersionOK = ameSFPEWSupportsVersionId(sfpewVersionId);
+        if (sfpewEnabled && !sfpewVersionOK) {
+            NSLog(@"[JavaLauncher] SFPEW overlay skipped: MC %@ needs no fixed-function emulation (SFPEW serves <= 1.16.x only)",
+                  sfpewVersionId);
+        }
+        // 独立选中 SFPEW（渲染器列表里的 SFPEW 项，而非叠加）：
+        // AMETHYST_RENDERER 已经是 SFPEW 本身，只需把真后端写进 SFPEW_EGL。
+        // 后端由 AMETHYST_SFPEW_BACKEND 指定，缺省 libmobileglues.dylib。
+        // 与叠加分支最终的环境变量形态完全一致，只是入口不同。
+        if (isSFPEWRenderer(renderer.UTF8String)) {
+            const char *backend = getenv("AMETHYST_SFPEW_BACKEND");
+            if (backend == NULL || backend[0] == '\0') backend = RENDERER_NAME_MOBILEGLUES;
+            setenv("AMETHYST_SFPEW_BACKEND", backend, 1);
+            NSString *bPathS = [NSString stringWithFormat:@"@rpath/%s", backend];
+            setenv("SFPEW_EGL", bPathS.UTF8String, 1);
+            if (!sfpewVersionOK) {
+                NSLog(@"[JavaLauncher] SFPEW standalone: MC %@ is outside the fixed-function era -- "
+                      @"expect no benefit (SFPEW serves <= 1.16.x only)", sfpewVersionId);
+            }
+            NSLog(@"[JavaLauncher] SFPEW standalone: backend=%s -> AMETHYST_RENDERER=%@, SFPEW_EGL=%@",
+                  backend, renderer, bPathS);
+        } else if (sfpewEnabled && sfpewVersionOK && isSFPEWOverlayEligibleRenderer(renderer.UTF8String)) {
+            const char *backend = renderer.UTF8String;
+            setenv("AMETHYST_SFPEW_BACKEND", backend, 1);
+            NSString *bPath = [NSString stringWithFormat:@"@rpath/%s", backend];
+            setenv("SFPEW_EGL", bPath.UTF8String, 1);
+            renderer = @ RENDERER_NAME_SFPEW;
+            setenv("AMETHYST_RENDERER", renderer.UTF8String, 1);
+            NSLog(@"[JavaLauncher] SFPEW overlay active: backend=%s -> AMETHYST_RENDERER=%@, SFPEW_EGL=%@",
+                  backend, renderer, bPath);
+        } else {
+            // 切换渲染器后清掉，避免残留影响后续启动
+            unsetenv("AMETHYST_SFPEW_BACKEND");
+            unsetenv("SFPEW_EGL");
+        }
+
+        // Mithril 渲染器（libmithril.dylib）自带 EGL + GL 3.3 Core（Vulkan backend），
+        // 不需要额外的环境变量：EGL 符号由 gl_bridge.m 的 dlsym_EGL() 从自身 dylib 解析，
+        // GL 上下文由 gl_init_context 用 EGL_OPENGL_BIT + EGL_OPENGL_API 创建。
+        // SDL3 在本项目走 uikit video driver（窗口由 UIKit/Metal 提供），
+        // 不涉及 SDL 的 EGL 库选择，因此无需设置 SDL 侧 EGL 路径。
+        if (isMithrilRenderer(renderer.UTF8String)) {
+            NSLog(@"[JavaLauncher] Mithril renderer active: EGL/GL from libmithril.dylib (Vulkan backend)");
+        }
         // Setup AMETHYST_GRAPHICS_API（MC 26.2+ Graphics API：default/vulkan/opengl）
         // 仅 MC 26.2+ 识别此选项，旧版本 MC 会忽略 options.txt 中的 graphicsApi 字段。
         //
@@ -517,6 +1280,13 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
         //   - "default"：清除 options.txt 中的 graphicsApi 行
         //   - prefer_vulkan/prefer_opengl：写入对应值
         NSString *graphicsApi = [PLProfiles resolveKeyForCurrentProfile:@"graphicsApi"];
+        // 诊断：渲染 API 切换无效时，靠这几行区分是「profile 里没存」还是
+        // 「读到了但值不对」。分别打印当前 profile 名、profile 内原始值、
+        // 以及全局偏好回退值。
+        NSLog(@"[JavaLauncher] graphicsApi raw=%@ (profile='%@', global=%@)",
+              graphicsApi ?: @"(nil)",
+              PLProfiles.current.selectedProfileName ?: @"(nil)",
+              getPrefObject(@"video.graphics_api") ?: @"(nil)");
         if (!graphicsApi || graphicsApi.length == 0) {
             graphicsApi = @"default";
         }
@@ -571,13 +1341,8 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
     setenv("JAVA_HOME", javaHome.UTF8String, 1);
     NSLog(@"[JavaLauncher] JAVA_HOME has been set to %@", javaHome);
 
-    int allocmem;
-    if (getPrefBool(@"java.auto_ram")) {
-        CGFloat autoRatio = getEntitlementValue(@"com.apple.private.memorystatus") ? 0.4 : 0.25;
-        allocmem = roundf((NSProcessInfo.processInfo.physicalMemory >> 20) * autoRatio);
-    } else {
-        allocmem = getPrefInt(@"java.allocated_memory");
-    }
+    // Task141：启动内存单一事实源（见 ame141_currentLaunchAllocMem）。
+    int allocmem = ame141_currentLaunchAllocMem();
     NSLog(@"[JavaLauncher] Max RAM allocation is set to %d MB", allocmem);
     if (!validateVirtualMemorySpace(allocmem)) {
         UIKit_returnToSplitView();
@@ -678,6 +1443,29 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
         NSLog(@"[JavaLauncher] Warning: SurfaceViewController class unavailable, Metallum will fall back to ObjC runtime lookup");
     }
 
+    // —— Sodium 启动检查规避（仅限 iOS 上必然误报的那一项）——
+    //
+    // Sodium 的 PreLaunchChecks 校验 LWJGL 运行时版本：
+    //     isUsingKnownCompatibleLwjglVersion()
+    //         = Version.getVersion().startsWith(REQUIRED_LWJGL_VERSION)
+    // REQUIRED_LWJGL_VERSION 由 Sodium 自行在编译期内联（1.20.1 -> 3.3.1，
+    // 1.20.6 / 1.21 -> 3.3.3）。而本启动器为 26.2+ 提供 LWJGL 3.4.1 —— 26.3 的
+    // SDL3 绑定需要它，无法降级。字符串比较必然失败，Sodium 随即弹出
+    // "Unsupported LWJGL" 并中止启动。
+    //
+    // Sodium 官方为这类检查留了关闭开关：BugChecks.configureCheck() 读取系统属性
+    // sodium.checks.<name>，issue2561 即 LWJGL 版本那一项（见 Sodium wiki
+    // "Disabling Bug Checks"）。这里以官方支持的方式关闭它，而不是伪造 LWJGL
+    // 版本号 —— 后者会让 Sodium 依据错误的版本信息做后续判断，风险更大。
+    //
+    // 另一项 isUsingPojavLauncher()（PostLaunchChecks）在 iOS 上本不会命中：它只
+    // 检查环境变量 POJAV_RENDERER，以及 java.library.path 中形如
+    // /data/user/<n>/net.kdt.pojavlaunch 的 Android 路径。本启动器设置的是
+    // AMETHYST_RENDERER，library.path 指向 app 内的 Frameworks 目录，两者都不匹配。
+    // 下方仍做一次防御性清理，防止"自定义环境变量"等途径把它带进来。
+    unsetenv("POJAV_RENDERER");
+    PUSH_MARGV_LITERAL("-Dsodium.checks.issue2561=false");
+
     PUSH_MARGV_LITERAL("-Dorg.lwjgl.glfw.checkThread0=false");
     PUSH_MARGV_LITERAL("-Dorg.lwjgl.system.allocator=system");
     //PUSH_MARGV_LITERAL("-Dorg.lwjgl.util.NoChecks=true");
@@ -767,7 +1555,7 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
             // 而非像无上下文的 gl4es 那样崩溃。
             //
             // 注意：vulkan.libname 不在此设置（对齐 Ynnyny），由 PojavLauncher.java 通过
-            // System.setProperty("org.lwjgl.vulkan.libname", "MoltenVK") 设置。
+            // System.setProperty("org.lwjgl.vulkan.libname", "libMoltenVK.dylib") 设置。
             // 若在此用 -D 传 "libMoltenVK.dylib"，LWJGL Library.loadNative 会加 "lib" 前缀和
             // ".dylib" 后缀，得到 "liblibMoltenVK.dylib.dylib"（错误文件名）。
             //
@@ -784,7 +1572,26 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
             ? RENDERER_NAME_MOBILEGLUES
             : glLibName;
 
-        PUSH_MARGV_FORMAT(@"-Dorg.lwjgl.opengl.libname=%s", openglLibName);
+        // 关键修复（libMobileGL-gles 加载失败）：这里必须传"裸名"，不能传完整文件名。
+        //
+        // LWJGL 的 Platform.mapLibraryName（macOS 分支）先用一个正则判断名字是否"已经是
+        // dylib 文件名"，是则原样返回，否则交给 System.mapLibraryName 补 "lib" 前缀和
+        // ".dylib" 后缀：
+        //     private final Pattern DYLIB =
+        //         Pattern.compile("(?:^|/)lib\\w+(?:[.]\\d+)*[.]dylib$");
+        //     if (DYLIB.matcher(name).find()) return name;
+        //     return System.mapLibraryName(name);
+        //
+        // \w 不含连字符，所以 "libMobileGL-gles.dylib" 不匹配该正则（"lib"+\w+ 在 '-' 处
+        // 断开），被误判为需要补前缀后缀 -> "liblibMobileGL-gles.dylib.dylib"，文件不存在
+        // -> UnsatisfiedLinkError。其余渲染器名（mobileglues / OSMesa.8 / gl4es_114 /
+        // MobileGL / MoltenVK）都能匹配，所以只有 GLES 这个带连字符的库名中招。
+        //
+        // 传裸名（去掉 "lib" 前缀与 ".dylib" 后缀）对全部渲染器都成立：裸名一定不匹配
+        // DYLIB 正则（开头不是 lib），于是统一走 System.mapLibraryName 补回，得到与磁盘
+        // 完全一致的文件名。
+        NSString *openglLibBareName = lwjglBareLibName(openglLibName);
+        PUSH_MARGV_FORMAT(@"-Dorg.lwjgl.opengl.libname=%s", openglLibBareName.UTF8String);
 
         // 关键修复（参照 FCL，阶段4：26.2 图形 API 切换无效）：
         // 之前仅在 renderer=libMoltenVK.dylib 时由 PojavLauncher.java 通过 System.setProperty 设置
@@ -794,12 +1601,19 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
         // FCL 做法：在 JVM 启动前通过 -D 系统属性同时确定 OpenGL 和 Vulkan 两条路径的 native 库，
         // 无论 MC 最终选哪条路都能找到对应的库。
         //
-        // 传裸名 "MoltenVK"，LWJGL Library.loadNative 会自动加 "lib" 前缀和 ".dylib" 后缀，
-        // 得到 "libMoltenVK.dylib"（正确文件名）。若传 "libMoltenVK.dylib" 会被包装成
-        // "liblibMoltenVK.dylib.dylib"（错误文件名）。
+        // 传裸名（由 lwjglBareLibName 从 RENDERER_NAME_VULKAN 剥出 "MoltenVK"）：裸名不匹配
+        // LWJGL 的 DYLIB 正则，必定走 System.mapLibraryName 补回 "lib" 前缀与 ".dylib" 后缀，
+        // 得到 "libMoltenVK.dylib"。
+        //
+        // 顺便修正此处原有注释：它声称传 "libMoltenVK.dylib" 会被二次包装成
+        // "liblibMoltenVK.dylib.dylib" —— 实际上 "libMoltenVK.dylib" 是匹配 DYLIB 正则的，
+        // 原样返回并不会被二次包装（日志中 Vulkan 正常加载即为佐证）。真正会中招的是
+        // 名字含连字符的库（见上方 opengl.libname 的修复）。改传裸名是为了与 opengl 侧
+        // 统一口径，也让规则对任何文件名都成立。
         //
         // 安全性：即使 MC 最终走 GL 路径，加载 MoltenVK 也无副作用（GL 路径不调用 Vulkan 入口）。
-        PUSH_MARGV_LITERAL("-Dorg.lwjgl.vulkan.libname=MoltenVK");
+        PUSH_MARGV_FORMAT(@"-Dorg.lwjgl.vulkan.libname=%s",
+                          lwjglBareLibName(RENDERER_NAME_VULKAN).UTF8String);
 
         // 显式指定 spirv-cross 库名（参照 catsruledogs/Amethyst-iOS-25）：
         // LWJGL spvc 模块默认查找 "spirv-cross" -> 加载 libspirv-cross.dylib（macOS 标准名），
@@ -831,6 +1645,44 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
   
     NSString *librariesPath = [NSString stringWithFormat:@"%@/libs", NSBundle.mainBundle.bundlePath];
     PUSH_MARGV_FORMAT(@"-javaagent:%@/patchjna_agent.jar=", librariesPath);
+    // [Metallum agent] 原生 Metal 后端（26.2 / 26.3）：
+    //   * jar 由 JavaApp/libs/others/ 随包落在 app/libs/（见根 Makefile 的 payload 目标），
+    //     agent 自带 metallum 类集与 natives/ios（libmetallum.dylib、libspvc.dylib），
+    //     运行期自行解出到沙盒，不需要 Frameworks 另行放置。
+    //   * 注入范围由 agent 自己判定（premain 按 MC 版本 / 加载器分流：26.2 走
+    //     classes262 类集、Fabric 缺桩时跳过相应步骤、Forge 走 dummy provider
+    //     且不注入自带 slf4j）。
+    //   * jar 不在 libs/ 时安静跳过，便于回滚与 A/B。
+    //   * [fix/java8-agent] 只对 MC major >= 26 挂载：agent 的 class 文件版本是
+    //     65.0（Java 21+ 编译），而老版本 MC 走 Java 8（class 上限 52.0）——
+    //     此前"老版本 MC 没有目标类，转换器天然 no-op"的假设漏掉了 agent
+    //     本身在 Java 8 上就加载不了这件事（UnsupportedClassVersionError ->
+    //     "processing of -javaagent failed" -> JVM 直接 abort，premain 阶段
+    //     全灭，GL/SFPEW 代码根本没机会跑）。1.7.10 + SFPEW 两路会话的
+    //     latestlog（43177bd 实测）即死于此。
+    //     26.x 强制 Java 25（ResolveLwjglVersion 同款 major 判定），class 65 可加载。
+    if ([[NSFileManager defaultManager] fileExistsAtPath:
+            [librariesPath stringByAppendingPathComponent:@"metallum_agent.jar"]]) {
+        NSString *metallumMcVersionId = nil;
+        if ([launchTarget isKindOfClass:NSDictionary.class]) {
+            metallumMcVersionId = [launchTarget[@"id"] description];
+        } else if ([launchTarget isKindOfClass:NSString.class]) {
+            metallumMcVersionId = (NSString *)launchTarget;
+        }
+        NSInteger metallumMcMajor = ame98_mcMajorFromVersionId(metallumMcVersionId);
+        if (metallumMcMajor >= 26) {
+            PUSH_MARGV_FORMAT(@"-javaagent:%@/metallum_agent.jar=", librariesPath);
+            // 把实例的 MC 版本 id 传给 agent（按版本选 metallum 类映射）
+            if (metallumMcVersionId.length > 0) {
+                PUSH_MARGV_FORMAT(@"-Dmetallum.mc.version=%@", metallumMcVersionId);
+            }
+            NSLog(@"[JavaLauncher] Metallum agent enabled: -javaagent:metallum_agent.jar (mcVersion=%@)",
+                  metallumMcVersionId);
+        } else {
+            NSLog(@"[JavaLauncher] Metallum agent skipped: MC major %ld < 26 (agent needs Java 21+ class files, this session runs Java 8)",
+                  (long)metallumMcMajor);
+        }
+    }
     if(getPrefBool(@"general.cosmetica")) {
         PUSH_MARGV_FORMAT(@"-javaagent:%@/arc_dns_injector.jar=23.95.137.176", librariesPath);
     }
@@ -954,6 +1806,16 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
         // Required by Cosmetica to inject DNS
         PUSH_MARGV_LITERAL("--add-opens=java.base/java.net=ALL-UNNAMED");
 
+        // ★ [FIX262] java.base/java.lang 必须对未命名模块 open：
+        //   metallum agent 用 defineClass 把 metallum 类集直接定义进 MC 的类加载器，
+        //   走的是 ClassLoader#defineClass 反射 + setAccessible(true)。未命名模块下
+        //   setAccessible 需要显式 opens，否则抛 InaccessibleObjectException:
+        //     module java.base does not "opens java.lang" to unnamed module
+        //   ⇒ defineMetallumClasses 整段失败，metallum 一个类都定义不上 ⇒ 26.2 起不来。
+        //   （Forge 下 agent 是命名模块，另由 agent 侧 Instrumentation.redefineModule
+        //     打开；这一条对两条路径都安全、无副作用。）
+        PUSH_MARGV_LITERAL("--add-opens=java.base/java.lang=ALL-UNNAMED");
+
         // Setup Caciocavallo
         PUSH_MARGV_LITERAL("-Dawt.toolkit=com.github.caciocavallosilano.cacio.ctc.CTCToolkit");
         PUSH_MARGV_LITERAL("-Djava.awt.graphicsenv=com.github.caciocavallosilano.cacio.ctc.CTCGraphicsEnvironment");
@@ -1047,25 +1909,124 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
     init_loadCustomJvmFlags(&margc, (const char **)margv);
     NSLog(@"[Init] Found JLI lib");
 
-    // 关键修复（26.2 启动崩溃）：单一 lwjgl.jar（对齐 Ynnyny 仓库）
-    // 之前 workspace 分裂为 lwjgl.jar 和 lwjgl33.jar，现对齐 Ynnyny 用单一合并 jar。
-    // 定制版 root lwjgl.jar（含 iOS 专用 LWJGL 补丁）已通过 JavaApp/Makefile 合并进 lwjgl.jar。
-    NSString *lwjglJar = [NSString stringWithFormat:@"%@/lwjgl.jar", librariesPath];
-    NSLog(@"[JavaLauncher] Using LWJGL jar at %@", lwjglJar);
+    // LWJGL 双版本：按 MC 版本选择 3.3.3 或 3.4.1（对齐 Ynnyny 仓库）
+    //
+    // 之前 workspace 用单一合并 lwjgl.jar；现按 LWJGL 版本拆分为
+    //   app/libs/lwjgl-333/lwjgl.jar 与 app/libs/lwjgl-341/lwjgl.jar，
+    // 由 ResolveLwjglVersion 在运行时选择其一。
+    //
+    // 两个 jar 在 JavaApp/Makefile 中均已合并定制版 root lwjgl.jar（含 iOS 专用
+    // LWJGL 补丁 + LWJGL2 兼容类 org/lwjgl/opengl/Display 等），因此老版本 MC
+    // （Java 8 / 1.12.2 及以下）不会因为换成 3.4.1 而失去 LWJGL2 API。
+    //
+    // MC 26.3 起窗口与输入从 GLFW 迁到 SDL3，必须使用 3.4.1 —— 它带真正的
+    // lwjgl-sdl.jar（加载真实 libSDL3），是 SDL3 输入注入的前提。
+    // MC 版本：优先用 launchTarget[@"id"]（实际启动的版本字典），
+    // 其次回落到当前 profile 的 lastVersionId。
+    // 注意 lastVersionId 可能是 "latest-release" 这类别名，直接拿来判断
+    // 主版本号会失败，所以 NSDictionary 分支优先用 id。
+    NSString *mcVersionId = nil;
+    if ([launchTarget isKindOfClass:NSDictionary.class]) {
+        mcVersionId = [launchTarget[@"id"] description];
+    } else if ([launchTarget isKindOfClass:NSString.class]) {
+        mcVersionId = (NSString *)launchTarget;
+    }
+    if (mcVersionId.length == 0) {
+        mcVersionId = [PLProfiles.current.selectedProfile[@"lastVersionId"] description];
+    }
+    NSString *lwjglVersion = ResolveLwjglVersion(
+        [PLProfiles resolveKeyForCurrentProfile:@"lwjglVersion"], mcVersionId);
+    NSLog(@"[JavaLauncher] Using LWJGL %@ (mcVersion=%@)", lwjglVersion, mcVersionId);
+    PUSH_MARGV_FORMAT(@"-Dpojav.lwjgl.version=%@", lwjglVersion);
 
-    // 校验目标 LWJGL jar 是否存在，避免静默崩溃
-    if (![fm fileExistsAtPath:lwjglJar]) {
+    // 符号隔离（26.3 + mobileglues 崩溃）：在 JVM 启动前预载渲染器
+    //
+    // 崩溃现场固定为 libshaderc.dylib +0x155820，
+    // TGlslangToSpvTraverser::visitAggregate —— 渲染器镜像内嵌的 glslang 与 LWJGL
+    // 随后加载的 libshaderc.dylib 合并后共用 AST 内存池，一方释放即导致另一方
+    // 解引用已释放内存（机理详见 egl_bridge.m 中 preload 处的注释）。
+    //
+    // egl_bridge 里那段 RTLD_LOCAL preload 挂在 SDL_GL_LoadLibrary 上，时机太晚：
+    // LWJGL 在 JVM 内 bootstrap 阶段就按 -Dorg.lwjgl.opengl.libname dlopen 了
+    // 渲染器。日志里两条证据 —— "Initializing MobileGlues ..." 出现在 egl_bridge
+    // preload 之前，且 egl_bridge 打出 "already loaded before preload"。镜像一旦
+    // 以 RTLD_GLOBAL 载入，后续再以 RTLD_LOCAL dlopen 同一文件只增加引用计数，
+    // 不会降级其可见性，隔离形同虚设。
+    //
+    // 故提前到此处（JLI_Launch 之前）以 RTLD_LOCAL 载入：LWJGL 此后的 dlopen 会
+    // 命中这份已加载镜像，可见性保持 RTLD_LOCAL，glslang 符号不再进全局空间。
+    //
+    // 不做 lwjglVersion 筛选，也不区分后端：26.2 与 26.3 同样使用 LWJGL 341
+    // （ResolveLwjglVersion 注释写的是「26.3 起」，实际判定为 major >= 26），
+    // 二者区别只在 26.2 走 GLFW、26.3 走 SDL3。但渲染器都是被 LWJGL 在 JVM 内
+    // bootstrap 阶段 dlopen 的，上述「预载太晚」问题对两条路径同样存在，
+    // 因此这里不按版本或后端分流，一律提前预载。
+    //
+    // 是否真正启用隔离只由下方渲染器排除规则决定：ANGLE 与 Mesa/gallium 需要向
+    // 其它镜像暴露符号，保持 RTLD_GLOBAL 并跳过；其余渲染器（含 MobileGlues、
+    // MobileGL 这类内嵌 glslang 的）走 RTLD_LOCAL。GLFW 老路径因此得到的也是
+    // 同一套语义，不存在「SDL3 才隔离」的分叉。
+    {
+        const char *preloadName = getenv("AMETHYST_RENDERER");
+        if (preloadName != NULL && strcmp(preloadName, RENDERER_NAME_VULKAN) == 0) {
+            // 与上方 opengl.libname 的取值规则保持一致：Vulkan renderer 下
+            // LWJGL 实际加载的是 MobileGlues。
+            preloadName = RENDERER_NAME_MOBILEGLUES;
+        }
+        // 逃生开关：置 0 时整个预载跳过，回到「由 LWJGL 自行 dlopen」的旧行为。
+        // 低版本（如 1.21.1）手动选用 MobileGlues 时若出现与隔离相关的回归，
+        // 可用此变量即时关闭，无需等待下一次构建。
+        const char *isolateOff = getenv("AMETHYST_PRELOAD_ISOLATE");
+        const BOOL preloadIsolateDisabled = (isolateOff != NULL && isolateOff[0] == '0');
+        if (preloadName != NULL && preloadName[0] != '\0') {
+            const char *forceGlobal = getenv("AMETHYST_RENDERER_RTLD_GLOBAL");
+            if (forceGlobal == NULL) forceGlobal = getenv("AMETHYST_MOBILEGL_RTLD_GLOBAL");
+            // 与 egl_bridge.m 同一套排除规则：需要向其他镜像暴露符号的渲染器
+            // 保持 RTLD_GLOBAL（ANGLE 是共享 EGL host；Mesa/gallium 内部互解析）。
+            // SFPEW 必须 RTLD_GLOBAL：它是 opengl.libname（LWJGL 的 GL 提供者），
+            // 而 LWJGL 在 iOS 上用 dlsym(RTLD_DEFAULT, "gl*") 解析 GL 入口。
+            // 若这里以 RTLD_LOCAL 预载，SFPEW 的 gl* 进不了 flat namespace，
+            // LWJGL 会命中 RTLD_GLOBAL 的 ANGLE 副本 —— 而当前上下文是 SFPEW
+            // 后端（MobileGL/MobileGlues）建的，ANGLE 侧无上下文，
+            // glCheckFramebufferStatus 等返回垃圾值（实测 93651672）。
+            // 这与 egl_bridge.m「preloading ... with RTLD_GLOBAL」的意图一致；
+            // 隔离只服务于 26.3/SDL3，SFPEW 面向 ≤1.16.5，无从冲突。
+            const BOOL needsGlobalSymbols =
+                strcmp(preloadName, RENDERER_NAME_MTL_ANGLE) == 0 ||
+                strncmp(preloadName, "libOSMesa", 9) == 0 ||
+                strcmp(preloadName, RENDERER_NAME_SFPEW) == 0;
+            const BOOL forceGlobalSymbols = (forceGlobal != NULL && forceGlobal[0] == '1');
+            if (preloadIsolateDisabled) {
+                NSLog(@"[JavaLauncher] renderer preload skipped: AMETHYST_PRELOAD_ISOLATE=0 (%s)",
+                      preloadName);
+            } else if (!needsGlobalSymbols && !forceGlobalSymbols) {
+                NSString *absPath = [NSString stringWithFormat:@"%@/%s", frameworksPath, preloadName];
+                void *handle = dlopen(absPath.UTF8String, RTLD_LOCAL);
+                NSLog(@"[JavaLauncher] preloaded %s with RTLD_LOCAL before JVM start (%s)",
+                      preloadName, handle != NULL ? "ok" : "FAILED");
+            }
+        }
+    }
+
+    NSString *lwjglDir = [NSString stringWithFormat:@"%@/lwjgl-%@", librariesPath, lwjglVersion];
+    NSLog(@"[JavaLauncher] Using LWJGL jar at %@/lwjgl.jar", lwjglDir);
+
+    // 校验目标 LWJGL 目录是否存在，避免静默崩溃。
+    // 注意：lwjgl-<ver>/ 是目录，不能用带 "/*" 的 classpath 条目做存在性判断。
+    BOOL lwjglDirIsDir = NO;
+    if (![fm fileExistsAtPath:lwjglDir isDirectory:&lwjglDirIsDir] || !lwjglDirIsDir) {
         UIKit_returnToSplitView();
-        showDialog(localize(@"Error", nil), [NSString stringWithFormat:@"LWJGL jar missing: %@", [lwjglJar lastPathComponent]]);
+        showDialog(localize(@"Error", nil), [NSString stringWithFormat:@"LWJGL jar missing: lwjgl-%@/lwjgl.jar", lwjglVersion]);
         return 1;
     }
+    NSString *lwjglJar = [NSString stringWithFormat:@"%@/*", lwjglDir];
 
     NSMutableString *classpathBuilder = [NSMutableString string];
     NSArray *libFiles = [fm contentsOfDirectoryAtPath:librariesPath error:nil];
     for (NSString *libFile in libFiles) {
-        // 精确排除合并后的 LWJGL jar，避免重复；保留其他以 lwjgl 开头的依赖 jar
-        if ([libFile hasSuffix:@".jar"] &&
-            ![libFile isEqualToString:@"lwjgl.jar"]) {
+        // 只收集 libs 下的 jar。lwjgl-333/ 与 lwjgl-341/ 是目录，不以 .jar 结尾，
+        // 不会被误收；版本化 LWJGL 由下方的 lwjglJar 单独追加。
+        if ([libFile hasSuffix:@".jar"]) {
             [classpathBuilder appendFormat:@"%@/%@:", librariesPath, libFile];
         }
     }
@@ -1107,6 +2068,14 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
         return -2;
     }
 
+    // Task97：JLI_Launch 前对齐进程 CWD 到游戏目录（桌面启动器等价行为；
+    // java.io[进程 CWD] 与 java.nio[user.dir] 的相对路径解析分裂会让混用两者的 mod 崩溃）。
+    ame97_alignProcessCwdToGameDir(gameDir);
+
+    // Task99：JLI_Launch 前注册 AppKit 菜单桩。必须在 MC Window.<init>
+    // （其内 MacosUtil 经 jna-objc 找 NSApplication）之前；幂等。
+    ame99_installAppKitMenuStubs();
+
     NSLog(@"[Init] Calling JLI_Launch");
 
     // Cr4shed known issue: exit after crash dump,
@@ -1130,4 +2099,241 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
                    "java", "openjdk",
                    /* (const_jargs != NULL) ? JNI_TRUE : */ JNI_FALSE,
                    JNI_TRUE, JNI_FALSE, JNI_TRUE);
+}
+
+// ============================================================================
+// Headless JVM（Forge/NeoForge 直装 processors 执行）
+// ============================================================================
+// 参照 launchJVM 的环境初始化与 JIT 前置，但 JVM 参数最小化：
+// - 无 caciocavallo / LWJGL / 渲染相关参数
+// - -Djava.awt.headless=true（processor 不需要图形环境）
+// - -cp 仅含 bundle libs（launcher.jar 内含 ForgeProcessorRunner，gson 等依赖也在其中）
+//
+// iOS 禁止 fork/exec，无法像 ZL2 那样为每个 processor spawn 子 JVM，
+// 但官方 Forge/NeoForge installer 本身就是在单个 JVM 内以 IsolatedClassLoader
+// 逐个执行 processor 的（ForgeProcessorRunner 复刻该行为）。
+//
+// 注意：调用后进程内 JVM 已创建，游戏启动必须重启 app（见 gJvmUsedInProcess）。
+int launchHeadlessJVM(NSString *mainClass, NSArray<NSString *> *args, int minJavaVersion) {
+    NSLog(@"[JavaLauncher] Beginning headless JVM launch: %@ (minJava=%d)", mainClass, minJavaVersion);
+
+    if (!mainClass.length) {
+        NSLog(@"[JavaLauncher] launchHeadlessJVM: mainClass is empty");
+        return -6;
+    }
+
+    // 进程内 JVM 只能创建一次
+    if (gJvmUsedInProcess) {
+        NSLog(@"[JavaLauncher] launchHeadlessJVM: JVM already created in this process, restart required");
+        return -5;
+    }
+
+    // JIT 前置检查：processor 执行与游戏一样依赖 JIT（HotSpot 始终 JIT 编译，
+    // 无 JIT 时必然 SIGILL 崩溃）。提前给出明确错误而不是让 JVM 莫名崩溃。
+    if (!isJITEnabled(NO)) {
+        NSLog(@"[JavaLauncher] launchHeadlessJVM: JIT is not enabled, cannot run processors");
+        showDialog(localize(@"Error", nil),
+            @"Java JIT is not enabled. Forge/NeoForge installation requires JIT.\n"
+            @"Please enable JIT (e.g. via StikDebug) and try again.");
+        return -1;
+    }
+
+    init_loadDefaultEnv();
+    init_loadCustomEnv();
+
+    // 安装器阶段同样可能崩（Forge/NeoForge processors），一并捕获。
+    // 位置同 launchJVM：必须在 init_loadCustomEnv() 之后才能读到开关。
+    ameInstallCrashCapture();
+
+    // 与 launchJVM 相同的 JIT26 处理（iOS 26+ 无 TXM 设备需要 Debug JIT Mapping）
+    DeviceGetJITFlags(YES);
+    BOOL requiresDebugJITMapping = DeviceNeedsDebugJITMapping();
+    BOOL jit26AlwaysAttached = getPrefBool(@"debug.debug_always_attached_jit");
+    if (requiresDebugJITMapping) {
+        static void *result;
+        if (!result) result = JIT26CreateRegionLegacy(getpagesize());
+        if ((uint32_t)result != 0x690000E0) {
+            munmap(result, getpagesize());
+            NSString *inBundleScriptPath = [NSBundle.mainBundle pathForResource:@"UniversalJIT26" ofType:@"js"];
+            NSString *lcAppInfoPath = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"LCAppInfo.plist"];
+            NSMutableDictionary *lcAppInfo = [NSMutableDictionary dictionaryWithContentsOfFile:lcAppInfoPath];
+            if (lcAppInfo) {
+                lcAppInfo[@"jitLaunchScriptJs"] = [[NSData dataWithContentsOfFile:inBundleScriptPath] base64EncodedStringWithOptions:0];
+                if ([lcAppInfo writeToFile:lcAppInfoPath atomically:YES]) {
+                    showDialog(localize(@"Error", nil), @"Amethyst was launched with a legacy script. We have updated the script to Universal, please restart LiveContainer to continue.");
+                    return -1;
+                }
+            }
+            [NSFileManager.defaultManager copyItemAtPath:inBundleScriptPath toPath:[NSString stringWithFormat:@"%s/UniversalJIT26.js", getenv("POJAV_HOME")] error:nil];
+            showDialog(localize(@"Error", nil), @"Support for legacy script has been removed. Please switch to Universal JIT script. To import it, long-press on Amethyst when enabling JIT in StikDebug and tap \"Assign Script\", then go to Amethyst's Documents directory and pick it. (on sideloaded StikDebug, the builtin script is named Amethyst-MeloNX.js)");
+            return -1;
+        }
+        JIT26SendJITScript([NSString stringWithContentsOfFile:[NSBundle.mainBundle pathForResource:@"UniversalJIT26Extension" ofType:@"js"]]);
+        JIT26SetDetachAfterFirstBr(!jit26AlwaysAttached);
+        task_set_exception_ports(mach_task_self(), EXC_MASK_BAD_ACCESS, 0, EXCEPTION_DEFAULT, MACHINE_THREAD_STATE);
+    }
+
+    if (!requiresDebugJITMapping || jit26AlwaysAttached) {
+        if (jit26AlwaysAttached) {
+            task_set_exception_ports(mach_task_self(), EXC_MASK_ALL & ~EXC_MASK_BREAKPOINT, 0,
+                EXCEPTION_DEFAULT, THREAD_STATE_NONE);
+        }
+        init_bypassDyldLibValidation();
+    } else {
+        NSLog(@"[DyldLVBypass] Hook disabled! Loading unsigned dylib will cause code signature error.");
+    }
+
+    // JRE 选择：按 minJavaVersion 推断 runtime tag（≥17 用 1_17_newer，否则 1_16_5_older），
+    // 失败回退 execute_jar。getSelectedJavaHome 内部会在 tag 槽位不满足 minVersion 时
+    // 搜索任意满足版本要求的 runtime。
+    NSString *defaultJRETag = (minJavaVersion >= 17) ? @"1_17_newer" : @"1_16_5_older";
+    NSString *javaHome = getSelectedJavaHome(defaultJRETag, minJavaVersion);
+    if (javaHome == nil) {
+        javaHome = getSelectedJavaHome(@"execute_jar", minJavaVersion);
+    }
+    if (javaHome == nil) {
+        NSLog(@"[JavaLauncher] launchHeadlessJVM: no Java runtime >= %d available", minJavaVersion);
+        showDialog(localize(@"Error", nil), [NSString stringWithFormat:localize(@"java.error.missing_runtime", nil),
+            @"Forge/NeoForge installer", minJavaVersion]);
+        return -3;
+    }
+    setenv("JAVA_HOME", javaHome.UTF8String, 1);
+    NSLog(@"[JavaLauncher] Headless JAVA_HOME set to %@", javaHome);
+
+    // user.home 指向独立临时目录，避免 processor 向主目录写入缓存
+    NSString *gameDir = @(getenv("POJAV_GAME_DIR"));
+    NSString *procHome = [gameDir stringByAppendingPathComponent:@".temp/forge_processor_home"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:procHome
+                              withIntermediateDirectories:YES
+                                               attributes:nil
+                                                    error:nil];
+
+    // dlopen libjli（Java 8 与 Java 11+ 双路径，对齐 launchJVM）
+    NSString *libjlipath8 = [NSString stringWithFormat:@"%@/lib/jli/libjli.dylib", javaHome];
+    NSString *libjlipath11 = [NSString stringWithFormat:@"%@/lib/libjli.dylib", javaHome];
+    BOOL isJava8 = [fm fileExistsAtPath:libjlipath8];
+    setenv("INTERNAL_JLI_PATH", (isJava8 ? libjlipath8 : libjlipath11).UTF8String, 1);
+    void *libjli = dlopen(getenv("INTERNAL_JLI_PATH"), RTLD_GLOBAL);
+    if (!libjli) {
+        const char *error = dlerror();
+        NSLog(@"[JavaLauncher] launchHeadlessJVM: JLI lib = NULL: %s", error ?: "unknown");
+        return -4;
+    }
+    pJLI_Launch = (JLI_Launch_func *)dlsym(libjli, "JLI_Launch");
+    if (pJLI_Launch == NULL) {
+        NSLog(@"[JavaLauncher] launchHeadlessJVM: JLI_Launch = NULL");
+        return -2;
+    }
+
+    // 构造最小化 JVM 参数
+    int margc = -1;
+    const char *margv[256];
+    NSMutableArray<NSString *> *retainedStrings = [NSMutableArray array];
+
+    #define PUSH_HARGV_LITERAL(literal) do { \
+        if (margc + 1 < 256) { \
+            margv[++margc] = (literal); \
+        } else { \
+            NSLog(@"[JavaLauncher] launchHeadlessJVM: margv limit reached, discarding %s", (literal)); \
+        } \
+    } while (0)
+
+    #define PUSH_HARGV_FORMAT(ns_fmt, ...) do { \
+        if (margc + 1 < 256) { \
+            NSString *_tmpStr = [NSString stringWithFormat:(ns_fmt), ##__VA_ARGS__]; \
+            [retainedStrings addObject:_tmpStr]; \
+            margv[++margc] = _tmpStr.UTF8String; \
+        } else { \
+            NSLog(@"[JavaLauncher] launchHeadlessJVM: margv limit reached, discarding formatted argument"); \
+        } \
+    } while (0)
+
+    PUSH_HARGV_FORMAT(@"%@/bin/java", javaHome);
+    PUSH_HARGV_LITERAL("-XstartOnFirstThread");
+    // headless：无 AWT/Swing 图形环境
+    PUSH_HARGV_LITERAL("-Djava.awt.headless=true");
+    PUSH_HARGV_LITERAL("-Xms64M");
+    PUSH_HARGV_LITERAL("-Xmx1G");
+    PUSH_HARGV_FORMAT(@"-Djava.library.path=%@/Frameworks", NSBundle.mainBundle.bundlePath);
+    PUSH_HARGV_FORMAT(@"-Duser.dir=%@", gameDir);
+    PUSH_HARGV_FORMAT(@"-Duser.home=%@", procHome);
+    PUSH_HARGV_FORMAT(@"-Duser.timezone=%@", NSTimeZone.localTimeZone.name);
+    PUSH_HARGV_LITERAL("-Dlog4j2.formatMsgNoLookups=true");
+    // Workaround random stack guard allocation crashes（对齐 launchJVM）
+    PUSH_HARGV_LITERAL("-XX:+UnlockExperimentalVMOptions");
+    PUSH_HARGV_LITERAL("-XX:+DisablePrimordialThreadGuardPages");
+    // CodeCache 参数（对齐 launchJVM：避免 CodeCache 满导致 SIGILL；
+    // iOS 26+ mirror mapped JIT 需要 64m 以内避免 SIGBUS）
+    PUSH_HARGV_LITERAL("-XX:ReservedCodeCacheSize=64m");
+    PUSH_HARGV_LITERAL("-XX:InitialCodeCacheSize=16m");
+    PUSH_HARGV_LITERAL("-XX:CodeCacheExpansionSize=4m");
+    if (@available(iOS 26.0, *)) {
+        PUSH_HARGV_LITERAL("-XX:+MirrorMappedCodeCache");
+    }
+    if (!getEntitlementValue(@"com.apple.developer.kernel.extended-virtual-addressing")) {
+        PUSH_HARGV_LITERAL("-XX:-UseCompressedClassPointers");
+    }
+
+    // classpath：bundle libs 下全部 jar（launcher.jar 含 ForgeProcessorRunner，gson 等也在其中）
+    // + 版本化 LWJGL 目录（lwjgl-333/ 或 lwjgl-341/）
+    NSString *librariesPath = [NSString stringWithFormat:@"%@/libs", NSBundle.mainBundle.bundlePath];
+    NSMutableString *classpathBuilder = [NSMutableString string];
+    NSArray *libFiles = [fm contentsOfDirectoryAtPath:librariesPath error:nil];
+    for (NSString *libFile in libFiles) {
+        // lwjgl-333/ 与 lwjgl-341/ 是目录，不以 .jar 结尾，不会被误收，
+        // 由下方按解析出的版本单独追加。
+        if ([libFile hasSuffix:@".jar"]) {
+            [classpathBuilder appendFormat:@"%@/%@:", librariesPath, libFile];
+        }
+    }
+    // headless JVM 用于 Forge/NeoForge 安装期的 processors，不运行 MC 本体，
+    // 但仍可能引用 LWJGL 类。这里按当前 profile 解析版本并追加对应目录。
+    NSString *headlessLwjglVersion = ResolveLwjglVersion(
+        [PLProfiles resolveKeyForCurrentProfile:@"lwjglVersion"],
+        PLProfiles.current.selectedProfile[@"lastVersionId"]);
+    [classpathBuilder appendFormat:@"%@/lwjgl-%@/*:", librariesPath, headlessLwjglVersion];
+    NSLog(@"[JavaLauncher] headless JVM using LWJGL %@", headlessLwjglVersion);
+    if (classpathBuilder.length > 0 && [classpathBuilder hasSuffix:@":"]) {
+        [classpathBuilder deleteCharactersInRange:NSMakeRange(classpathBuilder.length - 1, 1)];
+    }
+    PUSH_HARGV_LITERAL("-cp");
+    PUSH_HARGV_FORMAT(@"%@", classpathBuilder);
+
+    // main class 与其参数
+    PUSH_HARGV_FORMAT(@"%@", mainClass);
+    for (NSString *arg in args) {
+        if (margc + 1 < 256) {
+            [retainedStrings addObject:arg];
+            margv[++margc] = arg.UTF8String;
+        } else {
+            NSLog(@"[JavaLauncher] launchHeadlessJVM: margv limit reached, discarding extra argument");
+        }
+    }
+
+    // Cr4shed known issue（对齐 launchJVM）：重置信号处理器让 JVM 能捕获崩溃信号
+    signal(SIGSEGV, SIG_DFL);
+    signal(SIGPIPE, SIG_DFL);
+    signal(SIGBUS, SIG_DFL);
+    signal(SIGILL, SIG_DFL);
+    signal(SIGFPE, SIG_DFL);
+
+    // Task97：headless 路径同样对齐 CWD（Forge/NeoForge 安装期 processors 与主游戏
+    // 共用 -Duser.dir=<gameDir> 语义，桌面端安装器也总以 CWD == 游戏目录运行）。
+    ame97_alignProcessCwdToGameDir(gameDir);
+
+    NSLog(@"[JavaLauncher] Calling JLI_Launch (headless, %d args)", margc + 1);
+
+    // 标记进程内 JVM 已创建（此后任何 JLI_Launch 都会崩溃，需重启 app）
+    gJvmUsedInProcess = YES;
+
+    int ret = pJLI_Launch(++margc, margv,
+                   0, NULL,
+                   0, NULL,
+                   "1.8.0-internal",
+                   "1.8",
+                   "java", "openjdk",
+                   JNI_FALSE,
+                   JNI_TRUE, JNI_FALSE, JNI_TRUE);
+    NSLog(@"[JavaLauncher] Headless JLI_Launch returned %d", ret);
+    return ret;
 }

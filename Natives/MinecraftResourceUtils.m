@@ -6,8 +6,183 @@
 #import "MinecraftResourceUtils.h"
 #import "ios_uikit_bridge.h"
 #import "utils.h"
+#import "PLMirrorCenter.h"
+#import "UZKArchive.h"
 
 @implementation MinecraftResourceUtils
+
+#pragma mark - Forge/NeoForge 启动修复（参照 ZL2 Install.ForgeLike.progressIgnoreList）
+
+/// 判断点分版本号 a 是否 >= b（仅用于 bootstraplauncher 版本判断）
++ (BOOL)pl_version:(NSString *)a isBiggerOrEqualTo:(NSString *)b {
+    NSArray<NSString *> *aParts = [a componentsSeparatedByString:@"."];
+    NSArray<NSString *> *bParts = [b componentsSeparatedByString:@"."];
+    NSUInteger count = MAX(aParts.count, bParts.count);
+    for (NSUInteger i = 0; i < count; i++) {
+        NSInteger aValue = i < aParts.count ? aParts[i].integerValue : 0;
+        NSInteger bValue = i < bParts.count ? bParts[i].integerValue : 0;
+        if (aValue != bValue) return aValue > bValue;
+    }
+    return YES;
+}
+
++ (void)applyBootstrapLauncherIgnoreListFix:(NSMutableDictionary *)json {
+    NSArray *libraries = json[@"libraries"];
+    if (![libraries isKindOfClass:[NSArray class]]) libraries = @[];
+
+    NSDictionary *arguments = json[@"arguments"];
+    if (![arguments isKindOfClass:[NSDictionary class]]) return;
+    NSArray *jvm = arguments[@"jvm"];
+    if (![jvm isKindOfClass:[NSArray class]]) return;
+
+    // -DignoreList= 只出现在 Forge/NeoForge 的 bootstrap 版本 JSON 里，
+    // 找不到就没有 bootstraplauncher 的 JPMS 构建步骤，无需处理。
+    NSInteger ignoreListIndex = NSNotFound;
+    for (NSInteger i = (NSInteger)jvm.count - 1; i >= 0; i--) {
+        id arg = jvm[(NSUInteger)i];
+        if ([arg isKindOfClass:[NSString class]] && [arg hasPrefix:@"-DignoreList="]) {
+            ignoreListIndex = i;
+            break;
+        }
+    }
+    if (ignoreListIndex == NSNotFound) return;
+
+    // 识别 bootstrap 类库。groupId 不固定（cpw.mods / net.minecraftforge /
+    // net.neoforged 都出现过），因此只按 artifactId 判定，不再写死 cpw.mods。
+    BOOL hasBootstrap = NO;
+    for (id item in libraries) {
+        if (![item isKindOfClass:[NSDictionary class]]) continue;
+        NSString *name = item[@"name"];
+        if (![name isKindOfClass:[NSString class]]) continue;
+        NSArray<NSString *> *parts = [name componentsSeparatedByString:@":"];
+        if (parts.count < 3) continue;
+        NSString *artifactId = parts[1];
+        if ([artifactId rangeOfString:@"bootstrap" options:NSCaseInsensitiveSearch].location == NSNotFound) continue;
+        // cpw.mods:bootstraplauncher 0.1.17 以下不支持按名忽略，跳过
+        if ([parts[0] isEqualToString:@"cpw.mods"] &&
+            [artifactId isEqualToString:@"bootstraplauncher"] &&
+            ![self pl_version:parts[2] isBiggerOrEqualTo:@"0.1.17"]) {
+            continue;
+        }
+        hasBootstrap = YES;
+        break;
+    }
+    if (!hasBootstrap) {
+        NSLog(@"[MCDL] 检测到 -DignoreList= 但未匹配到 bootstrap 库，仍按 Forge/NeoForge 处理");
+    }
+
+    NSMutableArray *mutableJvm = [jvm mutableCopy];
+    NSString *updatedArg = mutableJvm[(NSUInteger)ignoreListIndex];
+
+    // iOS 特有：JavaApp/Makefile 在合成 lwjgl-<ver>.jar 时把 launcher 的
+    // com/apple/ios/audio/*.class 一并复制进去，导致 launcher.jar 与 lwjgl.jar
+    // 两个自动模块导出同一个包。Forge/NeoForge 的 bootstrap 走 JPMS
+    // (Configuration.resolveAndBind) 时直接失败：
+    //   java.lang.module.ResolutionException:
+    //   Modules launcher and lwjgl export package com.apple.ios.audio to module brigadier
+    // 把 lwjgl 加入 ignoreList：它仍留在 classpath 上供游戏正常调用，但不再被
+    // 当作模块解析，重复导出消失，模块图得以构建（幂等）。
+    if ([updatedArg rangeOfString:@"lwjgl" options:NSCaseInsensitiveSearch].location == NSNotFound) {
+        updatedArg = [updatedArg stringByAppendingString:@",lwjgl"];
+    } else {
+        return;
+    }
+
+    mutableJvm[(NSUInteger)ignoreListIndex] = updatedArg;
+    NSMutableDictionary *mutableArguments = [arguments mutableCopy];
+    mutableArguments[@"jvm"] = mutableJvm;
+    json[@"arguments"] = mutableArguments;
+    NSLog(@"[MCDL] Forge/NeoForge: 已向 -DignoreList 追加 lwjgl（消除 launcher/lwjgl 重复导出 com.apple.ios.audio 导致的 JPMS ResolutionException）");
+}
+
+#pragma mark - OptiFine launchwrapper（参照 ZL2 Install.OptiFine.checkOFLaunchWrapper）
+
++ (NSArray *)optifineLaunchWrapperLibrariesWithOptiFineJarPath:(NSString *)optifineJarPath
+                                                  librariesDir:(NSString *)librariesDir {
+    // 1. OptiFine 1.13+：安装包内嵌 launchwrapper-of（OptiFine 自带的 launchwrapper 分支）
+    NSError *archiveError = nil;
+    UZKArchive *archive = [[UZKArchive alloc] initWithPath:optifineJarPath error:&archiveError];
+    if (archive && !archiveError) {
+        NSData *versionData = [archive extractDataFromFile:@"launchwrapper-of.txt" error:nil];
+        if (versionData) {
+            NSString *lwVersion = [[[NSString alloc] initWithData:versionData encoding:NSUTF8StringEncoding]
+                                   stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (lwVersion.length > 0 &&
+                [lwVersion rangeOfString:@"^[0-9]+(\\.[0-9]+)*$" options:NSRegularExpressionSearch].location != NSNotFound) {
+                NSString *fileName = [NSString stringWithFormat:@"launchwrapper-of-%@.jar", lwVersion];
+                NSData *lwData = [archive extractDataFromFile:fileName error:nil];
+                if (lwData.length > 0) {
+                    NSString *relativePath = [NSString stringWithFormat:@"optifine/launchwrapper-of/%@/%@", lwVersion, fileName];
+                    NSString *absolutePath = [librariesDir stringByAppendingPathComponent:relativePath];
+                    [[NSFileManager defaultManager] createDirectoryAtPath:[absolutePath stringByDeletingLastPathComponent]
+                                              withIntermediateDirectories:YES attributes:nil error:nil];
+                    [lwData writeToFile:absolutePath options:NSDataWritingAtomic error:nil];
+                    NSLog(@"[MCDL] OptiFine launchwrapper-of %@ -> %@", lwVersion, relativePath);
+                    return @[@{
+                        @"name": [NSString stringWithFormat:@"optifine:launchwrapper-of:%@", lwVersion],
+                        @"downloads": @{@"artifact": @{
+                            @"path": relativePath,
+                            @"url": @"",
+                            @"size": @(lwData.length),
+                            @"sha1": @""
+                        }}
+                    }];
+                }
+            }
+        }
+    }
+
+    // 2. 旧版 OptiFine（1.12 及以下）：net.minecraft:launchwrapper:1.12
+    NSString *relativePath = @"net/minecraft/launchwrapper/1.12/launchwrapper-1.12.jar";
+    NSString *absolutePath = [librariesDir stringByAppendingPathComponent:relativePath];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:absolutePath]) {
+        NSURL *officialURL = [NSURL URLWithString:@"https://libraries.minecraft.net/net/minecraft/launchwrapper/1.12/launchwrapper-1.12.jar"];
+        NSData *data = nil;
+        for (NSURL *candidate in [PLMirrorCenter candidateURLsForOriginalURL:officialURL
+                                                                resourceType:PLMirrorResourceTypeModLoader]) {
+            data = [self pl_synchronousDownload:candidate];
+            if (data.length > 0) break;
+        }
+        if (data.length == 0) {
+            NSLog(@"[MCDL] OptiFine launchwrapper 1.12 下载失败");
+            return nil;
+        }
+        [[NSFileManager defaultManager] createDirectoryAtPath:[absolutePath stringByDeletingLastPathComponent]
+                                  withIntermediateDirectories:YES attributes:nil error:nil];
+        [data writeToFile:absolutePath options:NSDataWritingAtomic error:nil];
+    }
+    NSDictionary *attributes = [[NSFileManager defaultManager] attributesOfItemAtPath:absolutePath error:nil];
+    return @[@{
+        @"name": @"net.minecraft:launchwrapper:1.12",
+        @"downloads": @{@"artifact": @{
+            @"path": relativePath,
+            @"url": @"",
+            @"size": attributes[NSFileSize] ?: @(0),
+            @"sha1": @""
+        }}
+    }];
+}
+
+/// 同步下载（带移动端浏览器 UA，BMCLAPI 镜像校验 UA）
++ (NSData *)pl_synchronousDownload:(NSURL *)url {
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+    [request setValue:@"Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1" forHTTPHeaderField:@"User-Agent"];
+    request.timeoutInterval = 120;
+    __block NSData *result = nil;
+    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+    NSURLSessionDataTask *task = [[NSURLSession sharedSession]
+        dataTaskWithRequest:request
+          completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        if (!error && [response isKindOfClass:[NSHTTPURLResponse class]] &&
+            ((NSHTTPURLResponse *)response).statusCode == 200) {
+            result = data;
+        }
+        dispatch_semaphore_signal(semaphore);
+    }];
+    [task resume];
+    dispatch_semaphore_wait(semaphore, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(180 * NSEC_PER_SEC)));
+    return result;
+}
 
 // Handle inheritsFrom
 + (void)processVersion:(NSMutableDictionary *)json inheritsFrom:(NSMutableDictionary *)inheritsFrom {
@@ -181,6 +356,10 @@
     client[@"downloads"][@"artifact"][@"path"] = [NSString stringWithFormat:@"../versions/%1$@/%1$@.jar", json[@"id"]];
     client[@"name"] = [NSString stringWithFormat:@"%@.jar", json[@"id"]];
     [json[@"libraries"] addObject:client];
+
+    // Forge/NeoForge：把 lwjgl 追加进 -DignoreList。
+    // 必须在 jvm_processed 构建之前执行，否则改的是 arguments.jvm 而实际生效的是 jvm_processed。
+    [self applyBootstrapLauncherIgnoreListFix:json];
 
     // 解析所有版本的官方 JVM Arguments（包括 vanilla 26.x）。
     // 原代码仅在 inheritsFrom 存在时解析，导致 vanilla 版本的 arguments.jvm

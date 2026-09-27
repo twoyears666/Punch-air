@@ -49,6 +49,74 @@
 //   - Fragment shader 编译失败时忽略错误，让 BSL/Mellow 等光影包能运行
 #define RENDERER_NAME_LTW "libltw.dylib"
 
+// Metal 渲染器（metallum / MetalUniversal）：图形后端由 metallum agent 走原生 Metal
+// （直接 MTLDevice），不经过 EGL 渲染器 —— 选中它时 JavaLauncher 只置
+// AMETHYST_METAL=1（agent 据此打开渲染 patch），并把 AMETHYST_RENDERER 回落
+// auto（Surface 的 GL 上下文仍由 ANGLE 提供），与 metallum 官方集成一致
+// （渲染器只管 GL / Vulkan 回退）。
+// 渲染器 dylib 由 agent jar 自带（natives/ios/libmetallum.dylib，运行期解出）。
+#define RENDERER_NAME_METAL "libmetallum.dylib"
+
+// Mithril 渲染器 - OpenGL 3.3 Core → Vulkan/Metal 转译层（libmithril.dylib）。
+// 自带完整的 EGL 1.5 + GL 实现（Vulkan backend，经 MoltenVK 到 Metal），
+// 必须从自身 dylib 解析 EGL 符号：若复用 ANGLE 的 EGL，会创建 ANGLE 的 Metal
+// 上下文而非 Mithril 的 swapchain，且 eglChooseConfig 在 Mithril 的属性组合下
+// 可能返回 0 个配置，触发 gl_init_context 的 assert(bundle->config)。
+// 参考：Uniaball/Mithril-Wrapper 仓库 launcher-patch/ 下对 Air 的接入方式。
+#define RENDERER_NAME_MITHRIL "libmithril.dylib"
+
+// MobileGL - MobileGL-Dev 的桌面 OpenGL 实现（LGPL-3.0）。
+// 两个变体共用同一个 libMobileGL.dylib 二进制，由环境变量
+// MOBILEGL_BACKEND_TYPE 在运行时选择后端：
+//   libMobileGL.dylib       -> DirectVulkan（GL -> Vulkan -> MoltenVK -> Metal）
+//   libMobileGL-gles.dylib  -> DirectGLES（GL -> OpenGL ES）
+// 与 Mithril 一样自带 EGL 实现，必须从自身 dylib 解析 EGL 符号。
+// 参考：Swung0x48/Amethyst-iOS 提交 dc57bfd3d2 "feat: add MobileGL renderer support"。
+#define RENDERER_NAME_MOBILEGL "libMobileGL.dylib"
+#define RENDERER_NAME_MOBILEGL_GLES "libMobileGL-gles.dylib"
+
+// SimpleFPEWrapper（MobileGL-Dev，LGPL-3.0）—— 固定管线 (GL 1.x) 仿真层。
+// 接入方式对齐安卓 AngelAuraMC/Amethyst-Android @ feat/sfpew_angle：SFPEW 顶替
+// 渲染器被 LWJGL dlopen，真正的后端 EGL 由环境变量 SFPEW_EGL 指定，SFPEW 内部
+// dlopen 它并转发调用。安卓是 Tools.useSFPEW + SFPEW_EGL + 把 renderLibrary
+// 换成 libSimpleFPEWrapper.so；iOS 侧 AMETHYST_RENDERER 本身就是最终库名，
+// 故只需补 SFPEW_EGL（见 JavaLauncher.m）。
+#define RENDERER_NAME_SFPEW "libSimpleFPEWrapper.dylib"
+
+static inline bool isSFPEWRenderer(const char *renderer) {
+    return renderer && !strcmp(renderer, RENDERER_NAME_SFPEW);
+}
+
+// SFPEW 只能叠加在「OpenGL ES 后端」之上（对齐安卓 JREUtils：gl4es / system-gles /
+// zink 一律 Tools.useSFPEW=false，只有 MobileGlues 这类 GLES 后端才叠加）。
+// 桌面 GL→GLES 的 MobileGL-gles 同样属于 GLES 后端，故一并允许。
+static inline bool isSFPEWOverlayEligibleRenderer(const char *renderer) {
+    if (!renderer) return false;
+    return !strcmp(renderer, RENDERER_NAME_MOBILEGLUES) ||
+           !strcmp(renderer, RENDERER_NAME_MOBILEGL_GLES);
+}
+
+static inline bool isMobileGLRenderer(const char *renderer) {
+    return renderer && (!strcmp(renderer, RENDERER_NAME_MOBILEGL) ||
+                        !strcmp(renderer, RENDERER_NAME_MOBILEGL_GLES));
+}
+
+static inline bool isMithrilRenderer(const char *renderer) {
+    return renderer && !strcmp(renderer, RENDERER_NAME_MITHRIL);
+}
+
+// 自带 EGL 实现的渲染器：EGL 符号要从渲染器自己的 dylib 解析，不能用 ANGLE。
+static inline bool isSelfEglRenderer(const char *renderer) {
+    return isMithrilRenderer(renderer) || isMobileGLRenderer(renderer);
+}
+
+// 导出 desktop OpenGL（而非 OpenGL ES）的渲染器：
+// 需要 EGL_OPENGL_BIT 配置 + eglBindAPI(EGL_OPENGL_API)。
+static inline bool isDesktopGLRenderer(const char *renderer) {
+    return isMobileGLRenderer(renderer) || isMithrilRenderer(renderer) ||
+           (renderer && !strcmp(renderer, RENDERER_NAME_MTL_ANGLE));
+}
+
 #define SPECIALBTN_KEYBOARD -1
 #define SPECIALBTN_TOGGLECTRL -2
 #define SPECIALBTN_MOUSEPRI -3
@@ -150,6 +218,10 @@ BOOL CallbackBridge_nativeSendChar(jchar codepoint /* jint codepoint */);
 BOOL CallbackBridge_nativeSendCharMods(jchar codepoint, int mods);
 void CallbackBridge_nativeSendCursorPos(char event, CGFloat x, CGFloat y);
 void CallbackBridge_nativeSendKey(int key, int scancode, int action, int mods);
+// Task83：控件按钮键盘打字——按下时按 US ANSI 布局补发一个字符事件
+// （MC 1.13+ 聊天框只认 charTyped/text-input，纯 key 事件不进文本）。
+// 仅由按钮路径调用（SurfaceViewController executebtn），硬件键盘不走这里。
+BOOL CallbackBridge_buttonKeySynthesizeText(int key);
 void CallbackBridge_nativeSendMouseButton(int button, int action, int mods);
 void CallbackBridge_nativeSendScreenSize(int width, int height);
 void CallbackBridge_nativeSendScroll(CGFloat xoffset, CGFloat yoffset);
@@ -160,3 +232,11 @@ void CallbackBridge_pauseGameIfNeed();
 // 由 KeyboardInput.m 在物理键盘按下/释放事件中调用。
 void CallbackBridge_syncModifiersToMC(int mods);
 void CallbackBridge_queueModifierSync(int mods);
+
+// ---- Air 对齐：gl_bridge.m 实现的取证/呈现层接口（见 gl_bridge.m 内定义）----
+void ame_egl_swap_stats(unsigned long *ok, unsigned long *fail);
+void ame_egl_swap_framegap(unsigned int *maxGapMs, unsigned int *avgGapMs);
+void ame_egl_swap_phase_stats(unsigned int *presentAvgMs, unsigned int *presentMaxMs,
+                              unsigned int *buildAvgMs, unsigned int *buildMaxMs);
+bool ame_gl_surface_owns_layer(void);
+bool ame_gl_surface_transposed(void);
