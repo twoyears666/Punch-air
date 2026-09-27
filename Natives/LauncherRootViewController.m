@@ -504,7 +504,6 @@ static CGFloat LauncherRootLayoutRightPanelWidth(UITraitCollection *trait) {
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vm];
     nav.navigationBar.prefersLargeTitles = NO;
     ModsManagerViewController *m = [[ModsManagerViewController alloc] init];
-    m.initialMode = ModsManagerModeLocal;
     [nav pushViewController:m animated:NO];
     [self setContentViewController:nav animated:YES];
 }
